@@ -1,0 +1,4841 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+# Statistical Test for Reasoning Experiment (v2)
+
+
+```{r}
+# Install
+#install.packages(c("lme4","lmerTest","emmeans","broom.mixed","performance","tidyverse"))
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(broom.mixed)
+library(performance)
+library(tidyverse)
+library(brms)
+library(dplyr)
+library(knitr)
+# install.packages("cmdstanr", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+# cmdstanr::install_cmdstan()
+
+
+
+dir.create(tempdir(), recursive = TRUE, showWarnings = FALSE)
+
+df1 <- read_csv("C:\\Users\\joice\\MSRA\\reasoning\\cleaned_llm_reasoning.csv")
+df2 <- read_csv("C:\\Users\\joice\\MSRA\\reasoning\\cleaned_llm_answers.csv")
+colnames(df1)
+head(df1)
+```
+
+
+## Data Cleaning
+```{r}
+# Reshape from wide to long format (include per-item confidence & knowledge)
+reshape_to_long <- function(df, treatment_label) {
+  correct_cols <- grep("_got_correct$", names(df), value = TRUE)
+
+  conf_cols <- sub("_got_correct$", "_confidence", correct_cols)
+  know_cols <- sub("_got_correct$", "_knowledge", correct_cols)
+
+  # Pivot correct
+  df_correct <- df %>%
+    select(prolific_id, all_of(correct_cols)) %>%
+    pivot_longer(cols = all_of(correct_cols), names_to = "item_raw", values_to = "correct") %>%
+    mutate(item_id = str_remove(item_raw, "_got_correct")) %>%
+    select(-item_raw)
+
+  # Pivot confidence
+  df_conf <- df %>%
+    select(prolific_id, all_of(conf_cols)) %>%
+    pivot_longer(cols = -prolific_id, names_to = "conf_raw", values_to = "confidence") %>%
+    mutate(item_id = str_remove(conf_raw, "_confidence")) %>%
+    select(-conf_raw)
+
+  # Pivot knowledge
+  df_know <- df %>%
+    select(prolific_id, all_of(know_cols)) %>%
+    pivot_longer(cols = -prolific_id, names_to = "know_raw", values_to = "knowledge") %>%
+    mutate(item_id = str_remove(know_raw, "_knowledge")) %>%
+    select(-know_raw)
+
+  # Participant-level variables
+  participant_vars <- c("avg_confidence", "avg_knowledge", "crt_score", "response_id",
+                        "llm_familiarity", "llm_knowledge", "ai_truthful1","ai_helpful1", "ai_confident1", "ai_truthful2","ai_helpful2", "ai_confident2")
+
+  df_long <- df_correct %>%
+    left_join(df_conf, by = c("prolific_id", "item_id")) %>%
+    left_join(df_know, by = c("prolific_id", "item_id")) %>%
+    left_join(df %>% select(prolific_id, all_of(participant_vars)), by = "prolific_id") %>%
+    mutate(
+      # Extract domain from item_id
+      domain = str_extract(item_id, "^[a-z]+"),
+      treatment = treatment_label,
+      participant_id = prolific_id
+    ) %>%
+    select(prolific_id, response_id, participant_id, item_id, correct, confidence, knowledge,
+           everything())
+
+  return(df_long)
+}
+head(df1)
+
+
+# Reshape both treatment datasets
+df1_long <- reshape_to_long(df1, "reasoning")
+df2_long <- reshape_to_long(df2, "answer")
+head(df1_long)
+
+
+# Combine datasets
+df_combined <- bind_rows(df1_long, df2_long) %>%
+  mutate(
+    # Convert to proper types
+    correct = as.integer(correct),
+    treatment = factor(treatment, levels = c("answer", "reasoning")),
+    domain = factor(domain),
+    participant_id = factor(participant_id),
+    item_id = factor(item_id),
+    
+    # Z-score moderators for modeling
+    llm_familiarity_z = as.numeric(scale(llm_familiarity)),
+    llm_knowledge_z = as.numeric(scale(llm_knowledge)),
+    prior_knowledge_z = as.numeric(scale(avg_knowledge)),
+    confidence_z = as.numeric(scale(avg_confidence)),
+    crt_z = as.numeric(scale(crt_score))
+  )
+
+# Final clean dataset
+df_final <- df_combined %>%
+  select(participant_id, response_id, item_id, correct, treatment, domain,
+         prior_knowledge_z, confidence_z, crt_z, 
+         avg_knowledge, avg_confidence, crt_score,
+         llm_familiarity_z, llm_knowledge_z, ai_truthful1, ai_helpful1, ai_confident1,
+         ai_truthful2, ai_helpful2, ai_confident2,
+         confidence, knowledge) %>%
+  filter(complete.cases(.)) #filter out any questions participants did not answer
+
+
+# Add AI ground-truth labels and an SDT-ready agreement outcome.
+# said_ai_correct = 1 when the participant's judgment matches the AI's actual correctness.
+ground_truth <- read_csv("C:\\Users\\joice\\MSRA\\reasoning\\data\\reasoning_results_processed0728.csv") %>%
+  select(question_id, correctness) %>%
+  mutate(
+    item_num = str_extract(question_id, "^\\d+"),
+    q_suffix = str_extract(question_id, "Q\\d+$"),
+    domain_map = case_when(
+      q_suffix == "Q7" ~ "legal",
+      q_suffix == "Q13" ~ "math",
+      q_suffix == "Q22" ~ "finance",
+      q_suffix == "Q25" ~ "medical",
+      q_suffix == "Q31" ~ "misinfo",
+      TRUE ~ NA_character_
+    ),
+    item_id = paste0(domain_map, "_", item_num),
+    ai_correct = as.integer(correctness == TRUE | correctness == "True" | correctness == "TRUE")
+  ) %>%
+  select(item_id, ai_correct)
+
+df_final <- df_final %>%
+  left_join(ground_truth, by = "item_id") %>%
+  mutate(
+    said_ai_correct = as.integer(correct == ai_correct),
+    said_ai_label = factor(
+      ifelse(said_ai_correct == 1, "said_correct", "said_incorrect"),
+      levels = c("said_incorrect", "said_correct")
+    )
+  )
+
+
+# Summary statistics
+cat("Total observations:", nrow(df_final), "\n")
+cat("By treatment:\n")
+print(table(df_final$treatment)) # 250 per treatment
+
+cat("\nBy domain:\n")
+print(table(df_final$domain)) # 100 per domain
+
+cat("\nReasoning mean accuracy:", mean(df_final$correct[df_final$treatment == "reasoning"]), "\n")
+cat("\nAnswer mean accuracy:", mean(df_final$correct[df_final$treatment == "answer"]), "\n")
+cat("\nReasoning mean confidence:", mean(df_final$confidence[df_final$treatment == "reasoning"]), "\n")
+cat("Answer mean confidence:", mean(df_final$confidence[df_final$treatment == "answer"]), "\n")
+cat("Mean CRT score:", mean(df_final$crt_score), "\n")
+colnames(df_final)
+summary(df_final$ai_truthful2)
+
+write_csv(df_final, "C:\\Users\\joice\\MSRA\\reasoning\\df_final_llm_combined_long.csv")
+
+head(df_final)
+```
+
+
+
+## RQ1 Accuracy
+# Treatment main effect
+```{r}
+# Accuracy: model treatment effect, random intercepts for participants and items
+m_rq1 <- brm(
+  correct ~ treatment + (1|participant_id) + (1|item_id),
+  data=df_final, family=bernoulli()
+)
+summary(m_rq1)
+save(m_rq1, file="m_rq1.RData")
+
+#  Family: bernoulli 
+#   Links: mu = logit 
+# Formula: correct ~ treatment + (1 | participant_id) + (1 | item_id) 
+#    Data: df_final (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.06      0.19     0.72     1.47 1.00     1647     2356
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.23      0.16     0.01     0.60 1.00      941     1283
+
+# Regression Coefficients:
+#                    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept              0.39      0.22    -0.03     0.82 1.00     1761     2201
+# treatmentreasoning     0.06      0.21    -0.36     0.47 1.00     4550     2617
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+plot(marginal_effects(m_rq1, effects = "treatment"), ask = FALSE)
+
+
+# Accuracy by Domain: model modeling treatment with domain interaction, e.g. if in certain domains reasoning is more helpful
+m_rq1.2 <- brm(
+  correct ~ treatment * domain + (1|participant_id) + (1|item_id),
+  data = df_final,
+  family = bernoulli(link="logit"),
+  prior = c(
+    prior(normal(0, 1), class="b"),
+    prior(normal(0, 1.5), class="Intercept"),
+    prior(exponential(1), class="sd")
+  )
+)
+
+summary(m_rq1.2)
+```
+<!-- Multilevel Hyperparameters:
+~item_id (Number of levels: 50) 
+              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sd(Intercept)     1.12      0.20     0.76     1.54 1.00     1210     1870
+
+~participant_id (Number of levels: 100) 
+              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sd(Intercept)     0.21      0.15     0.01     0.55 1.00     1151     1778
+
+Regression Coefficients:
+                                 Estimate Est.Error l-95% CI u-95% CI Rhat
+Intercept                            0.48      0.36    -0.22     1.20 1.00
+treatmentreasoning                  -0.00      0.34    -0.65     0.68 1.00
+domainlegal                          0.06      0.52    -0.97     1.09 1.01
+domainmath                          -0.37      0.52    -1.37     0.66 1.00
+domainmedical                       -0.14      0.52    -1.18     0.88 1.01
+domainmisinfo                       -0.04      0.52    -1.06     1.01 1.00
+treatmentreasoning:domainlegal      -0.27      0.50    -1.24     0.73 1.00
+treatmentreasoning:domainmath        0.46      0.50    -0.52     1.45 1.00
+treatmentreasoning:domainmedical     0.32      0.49    -0.65     1.28 1.00
+treatmentreasoning:domainmisinfo    -0.13      0.49    -1.11     0.82 1.00
+                                 Bulk_ESS Tail_ESS
+Intercept                            1402     1946
+treatmentreasoning                   1917     2268
+domainlegal                          1285     2054
+domainmath                           1382     1951
+domainmedical                        1395     2049
+domainmisinfo                        1683     2318
+treatmentreasoning:domainlegal       2728     2995
+treatmentreasoning:domainmath        2420     2730
+treatmentreasoning:domainmedical     2551     2606
+treatmentreasoning:domainmisinfo     2867     3011
+
+Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+and Tail_ESS are effective sample size measures, and Rhat is the potential
+scale reduction factor on split chains (at convergence, Rhat = 1). -->
+
+
+
+# Acceptance behavior - SDT Probit
+```{r}
+# SDT model: participant judgment of AI correctness
+# - said_ai_correct is the participant's actual judgment (accepted AI = 1, rejected AI = 0)
+# - ai_correct is AI's true correctness (1 = correct, 0 = incorrect)
+
+df_sdt <- df_final %>%
+  filter(!is.na(said_ai_correct), !is.na(ai_correct)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    ai_correct = as.integer(ai_correct),
+    # Orthogonal coding makes interpretation cleaner
+    treat_c = if_else(treatment == "reasoning", 0.5, -0.5),
+    ai_c = if_else(ai_correct == 1, 0.5, -0.5)
+  )
+
+m_sdt_probit <- brm(
+  said_ai_correct ~ treat_c * ai_c + domain + (1 | participant_id) + (1 | item_id),
+  data = df_sdt,
+  family = bernoulli(link = "probit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+
+summary(m_sdt_probit)
+save(m_sdt_probit, file="models/m_sdt_probit.RData")
+
+
+ summary(m_sdt_probit)
+#  Family: bernoulli 
+#   Links: mu = probit 
+# Formula: said_ai_correct ~ treat_c * ai_c + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_sdt (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.23      0.13     0.01     0.50 1.01      685      865
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.48      0.13     0.23     0.73 1.00      968      968
+
+# Regression Coefficients:
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept         0.60      0.17     0.27     0.94 1.00     2199     2472
+# treat_c           0.72      0.17     0.40     1.05 1.00     3199     2245
+# ai_c              0.51      0.16     0.21     0.84 1.00     2718     2065
+# domainlegal      -0.14      0.23    -0.60     0.30 1.00     2651     2316
+# domainmath        0.09      0.23    -0.36     0.55 1.00     2440     2473
+# domainmedical     0.07      0.23    -0.39     0.53 1.00     2462     2088
+# domainmisinfo     0.01      0.23    -0.47     0.46 1.00     2112     2201
+# treat_c:ai_c      0.14      0.27    -0.42     0.67 1.00     4542     2401
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+# Warning message:
+# There were 1 divergent transitions after warmup. Increasing adapt_delta above 0.8 may help. See http://mc-stan.org/misc/warnings.html#divergent-transitions-after-warmup 
+
+
+
+# Posterior draws for SDT interpretation
+post <- as_draws_df(m_sdt_probit)
+
+# Criterion on the latent probit scale
+# Larger criterion = more conservative acceptance threshold
+post$criterion_answer <- -(post$b_Intercept - 0.5 * post$b_treat_c)
+post$criterion_reasoning <- -(post$b_Intercept + 0.5 * post$b_treat_c)
+
+# Discrimination (sensitivity to AI correctness)
+# Slope of ai_c within each treatment
+post$discrimination_answer <- post$b_ai_c - 0.5 * post$`b_treat_c:ai_c`
+post$discrimination_reasoning <- post$b_ai_c + 0.5 * post$`b_treat_c:ai_c`
+
+cat("P(criterion reasoning > answer): ",
+    mean(post$criterion_reasoning > post$criterion_answer), "\n")
+cat("P(discrimination reasoning > answer): ",
+    mean(post$discrimination_reasoning > post$discrimination_answer), "\n")
+cat("Criterion answer median: ",
+    median(post$criterion_answer), "\n")
+cat("Criterion reasoning median: ",
+    median(post$criterion_reasoning), "\n")
+cat("Discrimination answer median: ",
+    median(post$discrimination_answer), "\n")
+cat("Discrimination reasoning median: ",
+    median(post$discrimination_reasoning), "\n")
+
+```
+
+<!-- > cat("P(criterion reasoning > answer): ",
++     mean(post$criterion_reasoning > post$criterion_answer), "\n")
+P(criterion reasoning > answer):  0 
+> cat("P(discrimination reasoning > answer): ",
++     mean(post$discrimination_reasoning > post$discrimination_answer), "\n")
+P(discrimination reasoning > answer):  0.70425 
+> cat("Criterion answer median: ",
++     median(post$criterion_answer), "\n")
+Criterion answer median:  -0.2419003 
+> cat("Criterion reasoning median: ",
++     median(post$criterion_reasoning), "\n")
+Criterion reasoning median:  -0.9643037 
+> cat("Discrimination answer median: ",
++     median(post$discrimination_answer), "\n")
+Discrimination answer median:  0.4314719  -->
+
+```{r}
+criterion_diff <- post$criterion_reasoning - post$criterion_answer
+discrimination_diff <- post$discrimination_reasoning - post$discrimination_answer
+sdt_summary <- tibble(
+  metric = c(
+    "Criterion: answer",
+    "Criterion: reasoning",
+    "Discrimination: answer",
+    "Discrimination: reasoning",
+    "Criterion difference (reasoning - answer)",
+    "Discrimination difference (reasoning - answer)"
+  ),
+  median = c(
+    median(post$criterion_answer),
+    median(post$criterion_reasoning),
+    median(post$discrimination_answer),
+    median(post$discrimination_reasoning),
+    median(criterion_diff),
+    median(discrimination_diff)
+  ),
+  lower = c(
+    quantile(post$criterion_answer, 0.025),
+    quantile(post$criterion_reasoning, 0.025),
+    quantile(post$discrimination_answer, 0.025),
+    quantile(post$discrimination_reasoning, 0.025),
+    quantile(criterion_diff, 0.025),
+    quantile(discrimination_diff, 0.025)
+  ),
+  upper = c(
+    quantile(post$criterion_answer, 0.975),
+    quantile(post$criterion_reasoning, 0.975),
+    quantile(post$discrimination_answer, 0.975),
+    quantile(post$discrimination_reasoning, 0.975),
+    quantile(criterion_diff, 0.975),
+    quantile(discrimination_diff, 0.975)
+  ),
+  p_gt0 = c(
+    NA,
+    NA,
+    NA,
+    NA,
+    mean(criterion_diff > 0),
+    mean(discrimination_diff > 0)
+  )
+)
+
+knitr::kable(
+  sdt_summary %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
+  caption = "Posterior SDT summary on the latent probit scale"
+)
+```
+
+<!-- Table: Posterior SDT summary on the latent probit scale
+
+|metric                                         | median|  lower|  upper| p_gt0|
+|:----------------------------------------------|------:|------:|------:|-----:|
+|Criterion: answer                              | -0.242| -0.624|  0.101|    NA|
+|Criterion: reasoning                           | -0.964| -1.351| -0.577|    NA|
+|Discrimination: answer                         |  0.431|  0.059|  0.831|    NA|
+|Discrimination: reasoning                      |  0.577|  0.155|  1.039|    NA|
+|Criterion difference (reasoning - answer)      | -0.714| -1.046| -0.398| 0.000|
+|Discrimination difference (reasoning - answer) |  0.142| -0.416|  0.671| 0.704| -->
+
+
+# Verification/Error Detection
+```{r}
+## Error detection rate by condition (Verification)
+## Definition:
+## error_detection = said_ai_incorrect when ai is actually incorrect (ai_correct == 0)
+
+# If your "said_ai_correct" variable is 1 = said AI correct, 0 = said AI incorrect:
+# (If you instead have human_said_ai_correct, replace said_ai_correct below with that column.)
+df_err_det <- df_final %>%
+  filter(ai_correct == 0, !is.na(said_ai_correct), !is.na(treatment)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    said_ai_incorrect = 1L - said_ai_correct,
+    error_detection = said_ai_incorrect
+  )
+
+# Raw rates (descriptive)
+err_det_table <- df_err_det %>%
+  group_by(treatment) %>%
+  summarise(
+    n = n(),
+    error_detection_rate = mean(error_detection),
+    se = sqrt(error_detection_rate * (1 - error_detection_rate) / n),
+    ci_lwr = pmax(0, error_detection_rate - 1.96 * se),
+    ci_upr = pmin(1, error_detection_rate + 1.96 * se),
+    .groups = "drop"
+  )
+
+print(err_det_table)
+
+# A tibble: 2 × 6
+#   treatment     n error_detection_rate     se ci_lwr ci_upr
+#   <fct>     <int>                <dbl>  <dbl>  <dbl>  <dbl>
+# 1 answer      112                0.491 0.0472  0.398  0.584
+# 2 reasoning   123                0.268 0.0400  0.190  0.347
+
+# Mixed-effects model for error detection among AI-incorrect trials
+m_error_detection <- brm(
+  error_detection ~ treatment + domain + (1 | participant_id) + (1 | item_id),
+  data = df_err_det,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+
+summary(m_error_detection)
+save(m_error_detection, file="models/m_error_detection.RData")
+
+# > summary(m_error_detection)
+#  Family: bernoulli 
+#   Links: mu = logit 
+# Formula: error_detection ~ treatment + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_err_det (Number of observations: 235) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 23) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.35      0.25     0.01     0.91 1.00     1171     1680
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.90      0.39     0.13     1.66 1.01      691     1066
+
+# Regression Coefficients:
+#                    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept             -0.02      0.36    -0.70     0.71 1.00     2504     2335
+# treatmentreasoning    -1.00      0.37    -1.75    -0.29 1.00     2339     2452
+# domainlegal            0.13      0.46    -0.76     1.05 1.00     2860     2281
+# domainmath            -0.66      0.51    -1.68     0.30 1.00     2788     2964
+# domainmedical          0.11      0.46    -0.78     1.01 1.00     2398     2165
+# domainmisinfo         -0.12      0.47    -1.06     0.80 1.00     2631     2914
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+# > 
+
+# Posterior probability that reasoning has higher error-detection rate than answer
+post_ed <- as_draws_df(m_error_detection)
+cat("P(reasoning > answer) on log-odds scale: ",
+    mean(post_ed$b_treatmentreasoning > 0), "\n")
+# P(reasoning > answer) on log-odds scale:  0.003
+```
+
+
+
+```{r} 
+# Fig 2, 4-panel plot accuracy, criterion, discrimination, verification together
+set.seed(123)
+n_post_draws <- length(post$criterion_answer)
+beta_binom_summary <- function(data, outcome, parameter, n_draws = n_post_draws,
+                               prior_alpha = 1, prior_beta = 1) {
+  outcome <- rlang::ensym(outcome)
+
+  data %>%
+    group_by(treatment) %>%
+    summarise(
+      y = sum(!!outcome, na.rm = TRUE),
+      n = sum(!is.na(!!outcome)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      treatment = if_else(treatment == "answer", "Answer", "Reasoning"),
+      alpha_post = y + prior_alpha,
+      beta_post = n - y + prior_beta,
+      estimate = qbeta(0.5, alpha_post, beta_post),
+      lower = qbeta(0.025, alpha_post, beta_post),
+      upper = qbeta(0.975, alpha_post, beta_post),
+      draws = purrr::map2(alpha_post, beta_post, ~ rbeta(n_draws, .x, .y)),
+      parameter = parameter
+    ) %>%
+    select(parameter, treatment, estimate, lower, upper, draws)
+}
+
+posterior_diff_excludes_zero <- function(draw_df) {
+  reasoning_draws <- draw_df$draws[[match("Reasoning", draw_df$treatment)]]
+  answer_draws <- draw_df$draws[[match("Answer", draw_df$treatment)]]
+  diff <- reasoning_draws - answer_draws
+  q <- quantile(diff, c(0.025, 0.975), na.rm = TRUE)
+  q[1] > 0 || q[2] < 0
+}
+
+format_interval_label <- function(draws, digits = 2) {
+  q <- quantile(draws, c(0.025, 0.975), na.rm = TRUE)
+  sig_text <- if (q[1] > 0 || q[2] < 0) "95% CRI excl. 0" else "ns"
+  paste0(
+    sig_text,
+    "\n[",
+    round(q[1], digits),
+    ", ",
+    round(q[2], digits),
+    "]"
+  )
+}
+
+acc_post_df <- beta_binom_summary(df_final, correct, "Accuracy")
+verification_post_df <- beta_binom_summary(df_err_det, error_detection, "Verification")
+
+acc_df <- acc_post_df %>%
+  select(-draws)
+
+verification_df <- verification_post_df %>%
+  select(-draws)
+
+criterion_df <- bind_rows(
+  tibble(
+    parameter = "Criterion",
+    treatment = "Answer",
+    estimate = median(post$criterion_answer),
+    lower = quantile(post$criterion_answer, 0.025),
+    upper = quantile(post$criterion_answer, 0.975)
+  ),
+  tibble(
+    parameter = "Criterion",
+    treatment = "Reasoning",
+    estimate = median(post$criterion_reasoning),
+    lower = quantile(post$criterion_reasoning, 0.025),
+    upper = quantile(post$criterion_reasoning, 0.975)
+  )
+)
+
+discrimination_df <- bind_rows(
+  tibble(
+    parameter = "Discrimination",
+    treatment = "Answer",
+    estimate = median(post$discrimination_answer),
+    lower = quantile(post$discrimination_answer, 0.025),
+    upper = quantile(post$discrimination_answer, 0.975)
+  ),
+  tibble(
+    parameter = "Discrimination",
+    treatment = "Reasoning",
+    estimate = median(post$discrimination_reasoning),
+    lower = quantile(post$discrimination_reasoning, 0.025),
+    upper = quantile(post$discrimination_reasoning, 0.975)
+  )
+)
+
+plot_df <- bind_rows(acc_df, criterion_df, discrimination_df, verification_df) %>%
+  mutate(
+    parameter = factor(parameter, levels = c("Accuracy", "Criterion", "Discrimination", "Verification")),
+    panel = factor(
+      case_when(
+        parameter == "Accuracy" ~ "a  Accuracy",
+        parameter == "Criterion" ~ "b  Criterion",
+        parameter == "Discrimination" ~ "c  Discrimination",
+        parameter == "Verification" ~ "d  Verification"
+      ),
+      levels = c("a  Accuracy", "b  Criterion", "c  Discrimination", "d  Verification")
+    )
+  )
+
+acc_diff <- {
+  reasoning_draws <- acc_post_df$draws[[match("Reasoning", acc_post_df$treatment)]]
+  answer_draws <- acc_post_df$draws[[match("Answer", acc_post_df$treatment)]]
+  reasoning_draws - answer_draws
+}
+
+verification_diff <- {
+  reasoning_draws <- verification_post_df$draws[[match("Reasoning", verification_post_df$treatment)]]
+  answer_draws <- verification_post_df$draws[[match("Answer", verification_post_df$treatment)]]
+  reasoning_draws - answer_draws
+}
+
+criterion_diff <- post$criterion_reasoning - post$criterion_answer
+discrimination_diff <- post$discrimination_reasoning - post$discrimination_answer
+
+sig_label_by_parameter <- c(
+  "Accuracy" = format_interval_label(acc_diff),
+  "Criterion" = format_interval_label(criterion_diff),
+  "Discrimination" = format_interval_label(discrimination_diff),
+  "Verification" = format_interval_label(verification_diff)
+)
+
+sig_df <- plot_df %>%
+  group_by(parameter, panel) %>%
+  summarise(
+    .groups = "drop"
+  ) %>%
+  mutate(
+    x = 1.5,
+    y = Inf,
+    label = unname(sig_label_by_parameter[as.character(parameter)])
+  )
+
+p_sdt <- ggplot(plot_df, aes(x = treatment, y = estimate, color = treatment)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", color = "gray50") +
+  geom_pointrange(aes(ymin = lower, ymax = upper), linewidth = 0.8) +
+  geom_text(
+    data = sig_df,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    color = "black",
+    family = "Arial",
+    size = 3.1,
+    lineheight = 0.95,
+    vjust = 1.3
+  ) +
+  facet_wrap(~panel, scales = "free_y", nrow = 1) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = NULL,
+    y = "Estimate"
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    text = element_text(family = "Arial", size = 11, color = "black"),
+    axis.text = element_text(color = "black", size = 11),
+    axis.title = element_text(color = "black", size = 11),
+    strip.text = element_text(hjust = 0, color = "black", size = 11, face = "bold"),
+    legend.text = element_text(color = "black", size = 11),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+
+windows()
+p_sdt
+ggsave("plot/fig2_sdt_accuracy_criterion_discrimination_verification.jpg", p_sdt, width = 10, height = 3, dpi = 300)
+```
+
+
+
+
+## Confidence Calibration
+```{r}
+colnames(df_final)
+
+df_conf_participant <- df_final %>%
+  distinct(participant_id, treatment, avg_confidence) %>%
+  mutate(raw_confidence_z = as.numeric(scale(avg_confidence)))
+
+m_conf <- brm(
+  raw_confidence_z ~ treatment,
+  data = df_conf_participant,
+  family = gaussian()
+)
+
+summary(m_conf)
+save(m_conf, file="models/m_conf.RData")
+
+#  Family: gaussian 
+#   Links: mu = identity 
+# Formula: raw_confidence_z ~ treatment 
+#    Data: df_conf_participant (Number of observations: 100) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Regression Coefficients:
+#                    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept             -0.21      0.14    -0.49     0.06 1.00     3356     2717
+# treatmentreasoning     0.42      0.20     0.03     0.83 1.00     3498     2818
+
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     0.99      0.07     0.87     1.14 1.00     4164     2962
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+
+# Note: Run next cell first to get brier scores
+df_calib_participant <- df_final %>%
+  distinct(participant_id, treatment, brier_mean) %>%
+  mutate(
+    calibration_z = as.numeric(scale(-brier_mean)) #reverse brier score
+  )
+m_calib <- brm(
+  brier_mean ~ treatment,
+  data = df_final,
+  family = gaussian()
+)
+
+# > summary(m_calib)
+#  Family: gaussian 
+#   Links: mu = identity 
+# Formula: brier_mean ~ treatment 
+#    Data: df_final (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Regression Coefficients:
+#                    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept              0.33      0.01     0.31     0.35 1.00     4205     2717
+# treatmentreasoning    -0.00      0.01    -0.03     0.03 1.00     3956     2842
+
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     0.16      0.01     0.15     0.17 1.00     3636     2784
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+# > 
+
+summary(m_calib)
+save(m_calib, file="models/m_calib.RData")
+
+```
+
+
+
+
+# SDT for confidence and confidence calibration
+```{r}
+# Build respondent-level moderators for raw confidence and confidence calibration
+# Use Brier score as calibration error (lower = better calibration).
+# Confidence is on a 1-5 Likert scale, mapped linearly to probability [0, 1].
+df_final <- df_final %>%
+  mutate(
+    confidence_prob = pmin(pmax((as.numeric(confidence) - 1) / 4, 0), 1)
+  )
+head(df_final$confidence_prob)
+
+participant_calibration <- df_final %>%
+  group_by(participant_id) %>%
+  summarise(
+    brier_mean = mean((confidence_prob - correct)^2, na.rm = TRUE),
+    raw_confidence_mean = mean(confidence, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    brier_z = as.numeric(scale(brier_mean)),
+    raw_confidence_z = as.numeric(scale(raw_confidence_mean))
+  )
+
+df_final <- df_final %>%
+  left_join(
+    participant_calibration %>%
+      select(participant_id, brier_mean, brier_z, raw_confidence_mean, raw_confidence_z),
+    by = "participant_id"
+  )
+
+df_err_det_conf <- df_final %>%
+  filter(ai_correct == 0, !is.na(said_ai_correct), !is.na(treatment)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    said_ai_incorrect = 1L - said_ai_correct,
+    error_detection = said_ai_incorrect
+  )
+
+df_final$brier_z
+```
+
+```{r}
+# Raw-confidence-focused analyses for core outcomes
+# 1) Accuracy by raw confidence
+m_acc_conf <- brm(
+  correct ~ treatment * raw_confidence_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_final,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_acc_conf)
+save(m_acc_conf, file="models/m_acc_conf.RData")
+
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.10      0.20     0.74     1.54 1.00     1558     2673
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.22      0.16     0.01     0.59 1.00     1198     1839
+
+# Regression Coefficients:
+#                                     Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                               0.48      0.35    -0.24     1.17 1.00
+# treatmentreasoning                      0.02      0.22    -0.41     0.45 1.00
+# raw_confidence_z                        0.16      0.15    -0.12     0.45 1.00
+# domainlegal                            -0.08      0.48    -1.00     0.87 1.00
+# domainmath                             -0.18      0.48    -1.12     0.77 1.00
+# domainmedical                          -0.02      0.48    -0.98     0.92 1.00
+# domainmisinfo                          -0.09      0.47    -1.01     0.84 1.00
+# treatmentreasoning:raw_confidence_z    -0.10      0.22    -0.53     0.35 1.00
+#                                     Bulk_ESS Tail_ESS
+# Intercept                               1677     2209
+# treatmentreasoning                      4022     3075
+# raw_confidence_z                        3732     2904
+# domainlegal                             2097     2458
+# domainmath                              2293     2523
+# domainmedical                           2360     2364
+# domainmisinfo                           2136     2470
+# treatmentreasoning:raw_confidence_z     3506     2741
+
+
+# 2) Acceptance behavior by raw confidence (SDT-style probit)
+df_sdt_conf <- df_final %>%
+  filter(!is.na(said_ai_correct), !is.na(ai_correct), !is.na(raw_confidence_z)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    ai_correct = as.integer(ai_correct),
+    treat_c = if_else(treatment == "reasoning", 0.5, -0.5),
+    ai_c = if_else(ai_correct == 1, 0.5, -0.5)
+  )
+
+m_accept_conf <- brm(
+  said_ai_correct ~ treat_c * ai_c + raw_confidence_z + treat_c:raw_confidence_z + ai_c:raw_confidence_z + domain +
+    (1 | participant_id) + (1 | item_id),
+  data = df_sdt_conf,
+  family = bernoulli(link = "probit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_accept_conf)
+save(m_accept_conf, file="models/m_accept_conf.RData")
+
+# > summary(m_accept_conf)
+#  Family: bernoulli 
+#   Links: mu = probit 
+# Formula: said_ai_correct ~ treat_c * ai_c + raw_confidence_z + treat_c:raw_confidence_z + ai_c:raw_confidence_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_sdt_conf (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.21      0.13     0.01     0.48 1.00      912     1699
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.49      0.13     0.24     0.74 1.01      767     1092
+
+# Regression Coefficients:
+#                          Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                    0.61      0.17     0.28     0.94 1.00     1547
+# treat_c                      0.71      0.17     0.37     1.05 1.00     2107
+# ai_c                         0.51      0.15     0.21     0.81 1.00     2476
+# raw_confidence_z             0.03      0.09    -0.15     0.20 1.00     2499
+# domainlegal                 -0.14      0.22    -0.57     0.29 1.00     2020
+# domainmath                   0.09      0.23    -0.35     0.55 1.00     2201
+# domainmedical                0.06      0.22    -0.37     0.52 1.00     2240
+# domainmisinfo                0.05      0.22    -0.39     0.50 1.00     2048
+# treat_c:ai_c                 0.07      0.27    -0.47     0.61 1.00     3801
+# treat_c:raw_confidence_z    -0.06      0.18    -0.40     0.29 1.00     2757
+# ai_c:raw_confidence_z        0.20      0.14    -0.08     0.49 1.00     4234
+#                          Tail_ESS
+# Intercept                    1512
+# treat_c                      1968
+# ai_c                         2443
+# raw_confidence_z             2530
+# domainlegal                  1785
+# domainmath                   2191
+# domainmedical                2476
+# domainmisinfo                1995
+# treat_c:ai_c                 2678
+# treat_c:raw_confidence_z     2866
+# ai_c:raw_confidence_z        3048
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+# > 
+
+
+
+# 3) Error detection / verification by raw confidence
+m_error_detection_conf <- brm(
+  error_detection ~ treatment * raw_confidence_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_err_det_conf,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_error_detection_conf)
+save(m_error_detection_conf, file="models/m_error_detection_conf.RData")
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 23) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.33      0.24     0.01     0.89 1.00     1340     1837
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.01      0.40     0.17     1.80 1.01      818      991
+
+# Regression Coefficients:
+#                                     Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                              -0.01      0.37    -0.71     0.74 1.00
+# treatmentreasoning                     -1.06      0.37    -1.82    -0.36 1.00
+# raw_confidence_z                        0.05      0.24    -0.43     0.54 1.00
+# domainlegal                             0.12      0.46    -0.77     1.02 1.00
+# domainmath                             -0.68      0.53    -1.76     0.37 1.00
+# domainmedical                           0.12      0.45    -0.78     1.00 1.00
+# domainmisinfo                          -0.16      0.47    -1.08     0.77 1.00
+# treatmentreasoning:raw_confidence_z     0.14      0.37    -0.57     0.88 1.00
+#                                     Bulk_ESS Tail_ESS
+# Intercept                               3535     2516
+# treatmentreasoning                      4192     2699
+# raw_confidence_z                        3602     2636
+# domainlegal                             3896     2992
+# domainmath                              4508     2910
+# domainmedical                           3773     3266
+# domainmisinfo                           4041     2909
+# treatmentreasoning:raw_confidence_z     3650     2440
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+
+# Posterior probabilities for raw-confidence interactions
+post_acc_conf <- as_draws_df(m_acc_conf)
+cat("P(raw confidence interaction > 0) [accuracy]: ",
+    mean(post_acc_conf$`b_treatmentreasoning:raw_confidence_z` > 0), "\n")
+
+post_accept_conf <- as_draws_df(m_accept_conf)
+cat("P(treatment x raw confidence > 0) [acceptance]: ",
+    mean(post_accept_conf$`b_treat_c:raw_confidence_z` > 0), "\n")
+cat("P(ai correctness x raw confidence > 0) [acceptance]: ",
+    mean(post_accept_conf$`b_ai_c:raw_confidence_z` > 0), "\n")
+
+post_verif_conf <- as_draws_df(m_error_detection_conf)
+cat("P(raw confidence interaction > 0) [verification]: ",
+    mean(post_verif_conf$`b_treatmentreasoning:raw_confidence_z` > 0), "\n")
+```
+
+<!--
+P(raw confidence interaction > 0) [accuracy]:  0.31025 
+> post_accept_conf <- as_draws_df(m_accept_conf)
+> cat("P(treatment x raw confidence > 0) [acceptance]: ",
++     mean(post_accept_conf$`b_treat_c:raw_confidence_z` > 0), "\n")
+P(treatment x raw confidence > 0) [acceptance]:  0.378 
+> cat("P(ai correctness x raw confidence > 0) [acceptance]: ",
++     mean(post_accept_conf$`b_ai_c:raw_confidence_z` > 0), "\n")
+P(ai correctness x raw confidence > 0) [acceptance]:  0.9205 
+> post_verif_conf <- as_draws_df(m_error_detection_conf)
+> cat("P(raw confidence interaction > 0) [verification]: ",
++     mean(post_verif_conf$`b_treatmentreasoning:raw_confidence_z` > 0), "\n")
+P(raw confidence interaction > 0) [verification]:  0.64775 
+> 
+>  -->
+
+
+```{r}
+# 4-panel raw confidence relationship plot: confidence on x-axis, Answer vs Reasoning lines
+conf_grid <- seq(-2, 2, length.out = 60)
+
+# Accuracy predictions from m_acc_conf
+nd_acc_conf <- expand.grid(
+  raw_confidence_z = conf_grid,
+  treatment = levels(df_final$treatment),
+  domain = levels(df_final$domain)[1],
+  stringsAsFactors = FALSE
+)
+draws_acc_conf <- posterior_epred(m_acc_conf, newdata = nd_acc_conf, re_formula = NA)
+acc_conf_df <- nd_acc_conf %>%
+  mutate(
+    estimate = apply(draws_acc_conf, 2, mean),
+    lower = apply(draws_acc_conf, 2, quantile, probs = 0.025),
+    upper = apply(draws_acc_conf, 2, quantile, probs = 0.975),
+    parameter = "Accuracy"
+  )
+
+# Verification predictions from m_error_detection_conf
+nd_verif_conf <- expand.grid(
+  raw_confidence_z = conf_grid,
+  treatment = levels(df_err_det_conf$treatment),
+  domain = levels(df_err_det_conf$domain)[1],
+  stringsAsFactors = FALSE
+)
+draws_verif_conf <- posterior_epred(m_error_detection_conf, newdata = nd_verif_conf, re_formula = NA)
+verif_conf_df <- nd_verif_conf %>%
+  mutate(
+    estimate = apply(draws_verif_conf, 2, mean),
+    lower = apply(draws_verif_conf, 2, quantile, probs = 0.025),
+    upper = apply(draws_verif_conf, 2, quantile, probs = 0.975),
+    parameter = "Verification"
+  )
+
+# Criterion and discrimination on latent probit scale from m_accept_conf
+nd_accept_conf <- expand.grid(
+  raw_confidence_z = conf_grid,
+  treatment = levels(df_final$treatment),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(treat_c = if_else(treatment == "reasoning", 0.5, -0.5))
+
+criterion_conf_df <- bind_rows(lapply(seq_len(nrow(nd_accept_conf)), function(i) {
+  conf_i <- nd_accept_conf$raw_confidence_z[i]
+  tc_i <- nd_accept_conf$treat_c[i]
+
+  crit_draw <- -(
+    post_accept_conf$b_Intercept +
+      post_accept_conf$b_raw_confidence_z * conf_i +
+      post_accept_conf$b_treat_c * tc_i +
+      post_accept_conf$`b_treat_c:raw_confidence_z` * tc_i * conf_i
+  )
+
+  tibble(
+    raw_confidence_z = conf_i,
+    treatment = nd_accept_conf$treatment[i],
+    estimate = mean(crit_draw),
+    lower = quantile(crit_draw, 0.025),
+    upper = quantile(crit_draw, 0.975),
+    parameter = "Criterion"
+  )
+}))
+
+discrimination_conf_df <- bind_rows(lapply(seq_len(nrow(nd_accept_conf)), function(i) {
+  conf_i <- nd_accept_conf$raw_confidence_z[i]
+  tc_i <- nd_accept_conf$treat_c[i]
+
+  discrim_draw <-
+    post_accept_conf$b_ai_c +
+    post_accept_conf$`b_ai_c:raw_confidence_z` * conf_i +
+    post_accept_conf$`b_treat_c:ai_c` * tc_i
+
+  tibble(
+    raw_confidence_z = conf_i,
+    treatment = nd_accept_conf$treatment[i],
+    estimate = mean(discrim_draw),
+    lower = quantile(discrim_draw, 0.025),
+    upper = quantile(discrim_draw, 0.975),
+    parameter = "Discrimination"
+  )
+}))
+
+conf_plot_df <- bind_rows(acc_conf_df, criterion_conf_df, discrimination_conf_df, verif_conf_df) %>%
+  mutate(
+    treatment = if_else(treatment == "answer", "Answer", "Reasoning"),
+    parameter = factor(parameter, levels = c("Accuracy", "Criterion", "Discrimination", "Verification")),
+    panel = factor(
+      case_when(
+        parameter == "Accuracy" ~ "a  Accuracy",
+        parameter == "Criterion" ~ "b  Criterion",
+        parameter == "Discrimination" ~ "c  Discrimination",
+        parameter == "Verification" ~ "d  Verification"
+      ),
+      levels = c("a  Accuracy", "b  Criterion", "c  Discrimination", "d  Verification")
+    )
+  )
+
+if (!exists("format_interval_label")) {
+  format_interval_label <- function(draws, digits = 2) {
+    q <- quantile(draws, c(0.025, 0.975), na.rm = TRUE)
+    sig_text <- if (q[1] > 0 || q[2] < 0) "95% CRI excl. 0" else "ns"
+    paste0(
+      sig_text,
+      "\n[",
+      round(q[1], digits),
+      ", ",
+      round(q[2], digits),
+      "]"
+    )
+  }
+}
+
+conf_label_by_parameter <- c(
+  "Accuracy" = format_interval_label(post_acc_conf$`b_treatmentreasoning:raw_confidence_z`),
+  "Criterion" = format_interval_label(post_accept_conf$`b_treat_c:raw_confidence_z`),
+  "Discrimination" = format_interval_label(post_accept_conf$`b_ai_c:raw_confidence_z`),
+  "Verification" = format_interval_label(post_verif_conf$`b_treatmentreasoning:raw_confidence_z`)
+)
+
+sig_conf_df <- conf_plot_df %>%
+  group_by(parameter, panel) %>%
+  summarise(
+    x = max(raw_confidence_z, na.rm = TRUE) - 1.5,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    y = Inf,
+    label = unname(conf_label_by_parameter[as.character(parameter)])
+  )
+
+p_conf_sdt <- ggplot(conf_plot_df, aes(x = raw_confidence_z, y = estimate, color = treatment, fill = treatment)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_text(
+    data = sig_conf_df,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    color = "black",
+    family = "Arial",
+    size = 3.1,
+    lineheight = 0.95,
+    vjust = 0.9
+  ) +
+  facet_wrap(~panel, scales = "free_y", nrow = 1) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.28))) +
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  scale_fill_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = "Raw confidence (z)",
+    y = "Estimate"
+  ) +
+  theme_minimal(base_size = 16, base_family = "Arial") +
+  theme(
+    text = element_text(family = "Arial", size = 16),
+    strip.text = element_text(face = "bold", hjust = 0, color = "black"),
+    legend.position = "none",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+
+print(p_conf_sdt)
+ggsave("plot/fig_confidence_accuracy_criterion_discrimination_verification.jpg", p_conf_sdt, width = 10, height = 3, dpi = 300)
+```
+
+
+
+```{r}
+# Calibration-focused analyses for core outcomes (Brier score)
+# Higher brier_z = worse calibration.
+
+# 1) Accuracy by calibration
+m_acc_cal <- brm(
+  correct ~ treatment * brier_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_final,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_acc_cal)
+save(m_acc_cal, file="models/m_acc_cal.RData")
+
+# > summary(m_acc_cal)
+#  Family: bernoulli 
+#   Links: mu = logit 
+# Formula: correct ~ treatment * brier_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_final (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.10      0.21     0.72     1.54 1.00     1360     2298
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.21      0.16     0.01     0.58 1.01      921     1827
+
+# Regression Coefficients:
+#                            Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                      0.45      0.36    -0.27     1.13 1.00     1333
+# treatmentreasoning             0.06      0.21    -0.37     0.49 1.00     4653
+# brier_z                        0.06      0.15    -0.23     0.36 1.00     2719
+# domainlegal                   -0.06      0.48    -1.00     0.87 1.00     1793
+# domainmath                    -0.17      0.51    -1.18     0.81 1.00     1496
+# domainmedical                 -0.01      0.49    -0.99     0.98 1.00     1650
+# domainmisinfo                 -0.10      0.47    -1.07     0.85 1.00     1678
+# treatmentreasoning:brier_z    -0.18      0.22    -0.60     0.25 1.00     2897
+#                            Tail_ESS
+# Intercept                      1719
+# treatmentreasoning             2732
+# brier_z                        2597
+# domainlegal                    2071
+# domainmath                     2330
+# domainmedical                  2305
+# domainmisinfo                  2072
+# treatmentreasoning:brier_z     2648
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+
+df_sdt_cal <- df_final %>%
+  filter(!is.na(said_ai_correct), !is.na(ai_correct), !is.na(brier_z)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    ai_correct = as.integer(ai_correct),
+    treat_c = if_else(treatment == "reasoning", 0.5, -0.5),
+    ai_c = if_else(ai_correct == 1, 0.5, -0.5)
+  )
+
+m_accept_cal <- brm(
+  said_ai_correct ~ treat_c * ai_c + brier_z + treat_c:brier_z + ai_c:brier_z + domain +
+    (1 | participant_id) + (1 | item_id),
+  data = df_sdt_cal,
+  family = bernoulli(link = "probit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_accept_cal)
+save(m_accept_cal, file="models/m_accept_cal.RData")
+
+# > summary(m_accept_cal)
+#  Family: bernoulli 
+#   Links: mu = probit 
+# Formula: said_ai_correct ~ treat_c * ai_c + brier_z + treat_c:brier_z + ai_c:brier_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_sdt_cal (Number of observations: 475) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.29      0.14     0.02     0.57 1.00      890     1255
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.46      0.14     0.13     0.72 1.00      823      635
+
+# Regression Coefficients:
+#                 Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept           0.69      0.19     0.33     1.07 1.00     2732     2316
+# treat_c             0.82      0.18     0.49     1.18 1.00     3076     2669
+# ai_c                0.65      0.18     0.31     1.01 1.00     3406     2550
+# brier_z             0.20      0.09     0.03     0.39 1.00     4048     3039
+# domainlegal        -0.22      0.25    -0.70     0.27 1.00     2940     2541
+# domainmath          0.06      0.26    -0.44     0.58 1.00     3052     2670
+# domainmedical       0.08      0.25    -0.39     0.58 1.00     3262     2504
+# domainmisinfo      -0.06      0.24    -0.53     0.41 1.00     3255     2828
+# treat_c:ai_c        0.32      0.29    -0.23     0.91 1.00     4325     2281
+# treat_c:brier_z     0.18      0.18    -0.18     0.54 1.00     3723     3034
+# ai_c:brier_z        0.12      0.15    -0.18     0.42 1.00     5354     2800
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+# > save(m_accept_cal, file="models/m_accept_cal.RData")
+
+
+# 3) Error detection / verification by calibration
+m_error_detection_cal <- brm(
+  error_detection ~ treatment * brier_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_err_det_conf,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+save(m_error_detection_cal, file="models/m_error_detection_cal.RData")
+summary(m_error_detection_cal)
+
+
+> summary(m_error_detection_cal)
+ Family: bernoulli 
+  Links: mu = logit 
+Formula: error_detection ~ treatment * brier_z + domain + (1 | participant_id) + (1 | item_id) 
+   Data: df_err_det_conf (Number of observations: 235) 
+  Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+         total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 23) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.34      0.25     0.02     0.93 1.00     1137     1567
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.96      0.39     0.15     1.74 1.01      575      781
+
+# Regression Coefficients:
+#                            Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                     -0.02      0.36    -0.74     0.69 1.00     2350
+# treatmentreasoning            -0.99      0.37    -1.74    -0.28 1.00     2697
+# brier_z                       -0.05      0.25    -0.56     0.43 1.00     2109
+# domainlegal                    0.12      0.45    -0.74     1.00 1.00     3109
+# domainmath                    -0.66      0.54    -1.74     0.39 1.00     2755
+# domainmedical                  0.10      0.45    -0.77     1.00 1.00     2469
+# domainmisinfo                 -0.12      0.47    -1.04     0.79 1.00     2857
+# treatmentreasoning:brier_z    -0.22      0.35    -0.91     0.46 1.00     2362
+#                            Tail_ESS
+# Intercept                      2663
+# treatmentreasoning             2794
+# brier_z                        2511
+# domainlegal                    3069
+# domainmath                     2452
+# domainmedical                  2252
+# domainmisinfo                  2999
+# treatmentreasoning:brier_z     2516
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+# Posterior probabilities for calibration interactions
+post_acc_cal <- as_draws_df(m_acc_cal)
+cat("P(calibration interaction > 0) [accuracy]: ",
+    mean(post_acc_cal$`b_treatmentreasoning:brier_z` > 0), "\n")
+
+post_accept_cal <- as_draws_df(m_accept_cal)
+cat("P(treatment x calibration > 0) [acceptance]: ",
+    mean(post_accept_cal$`b_treat_c:brier_z` > 0), "\n")
+cat("P(ai correctness x calibration > 0) [acceptance]: ",
+    mean(post_accept_cal$`b_ai_c:brier_z` > 0), "\n")
+
+post_verif_cal <- as_draws_df(m_error_detection_cal)
+cat("P(calibration interaction > 0) [verification]: ",
+    mean(post_verif_cal$`b_treatmentreasoning:brier_z` > 0), "\n")
+```
+
+<!-- > cat("P(calibration interaction > 0) [accuracy]: ",
+P(treatment x calibration > 0) [acceptance]:  0.855 
+P(ai correctness x calibration > 0) [acceptance]:  0.77675
+P(calibration interaction > 0) [verification]:  0.2565 
+>  -->
+
+
+```{r}
+# 4-panel calibration plot by condition (Answer vs Reasoning), with higher = better interpretation
+# Accuracy predictions from m_acc_cal at average calibration (brier_z = 0)
+
+nd_acc_cal <- expand.grid(
+  brier_z = 0,
+  treatment = levels(df_final$treatment),
+  domain = levels(df_final$domain)[1],
+  stringsAsFactors = FALSE
+)
+draws_acc_cal <- posterior_epred(m_acc_cal, newdata = nd_acc_cal, re_formula = NA)
+acc_cal_df <- nd_acc_cal %>%
+  transmute(
+    treatment,
+    estimate = apply(draws_acc_cal, 2, mean),
+    lower = apply(draws_acc_cal, 2, quantile, probs = 0.025),
+    upper = apply(draws_acc_cal, 2, quantile, probs = 0.975),
+    parameter = "Accuracy"
+  )
+
+# Verification predictions from m_error_detection_cal at average calibration (brier_z = 0)
+nd_verif_cal <- expand.grid(
+  brier_z = 0,
+  treatment = levels(df_err_det_conf$treatment),
+  domain = levels(df_err_det_conf$domain)[1],
+  stringsAsFactors = FALSE
+)
+draws_verif_cal <- posterior_epred(m_error_detection_cal, newdata = nd_verif_cal, re_formula = NA)
+verif_cal_df <- nd_verif_cal %>%
+  transmute(
+    treatment,
+    estimate = apply(draws_verif_cal, 2, mean),
+    lower = apply(draws_verif_cal, 2, quantile, probs = 0.025),
+    upper = apply(draws_verif_cal, 2, quantile, probs = 0.975),
+    parameter = "Verification"
+  )
+
+# Criterion and discrimination from m_accept_cal at average calibration (brier_z = 0)
+nd_accept_cal <- expand.grid(
+  treatment = levels(df_final$treatment),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(treat_c = if_else(treatment == "reasoning", 0.5, -0.5))
+
+criterion_cal_df <- bind_rows(lapply(seq_len(nrow(nd_accept_cal)), function(i) {
+  tc_i <- nd_accept_cal$treat_c[i]
+
+  crit_draw <- -(
+    post_accept_cal$b_Intercept +
+      post_accept_cal$b_treat_c * tc_i
+  )
+
+  # Reverse criterion sign so larger values align with "better" direction.
+  crit_better <- -crit_draw
+
+  tibble(
+    treatment = nd_accept_cal$treatment[i],
+    estimate = mean(crit_better),
+    lower = quantile(crit_better, 0.025),
+    upper = quantile(crit_better, 0.975),
+    parameter = "Criterion"
+  )
+}))
+
+discrimination_cal_df <- bind_rows(lapply(seq_len(nrow(nd_accept_cal)), function(i) {
+  tc_i <- nd_accept_cal$treat_c[i]
+
+  discrim_draw <-
+    post_accept_cal$b_ai_c +
+    post_accept_cal$`b_treat_c:ai_c` * tc_i
+
+  tibble(
+    treatment = nd_accept_cal$treatment[i],
+    estimate = mean(discrim_draw),
+    lower = quantile(discrim_draw, 0.025),
+    upper = quantile(discrim_draw, 0.975),
+    parameter = "Discrimination"
+  )
+}))
+
+cal_plot_df <- bind_rows(acc_cal_df, criterion_cal_df, discrimination_cal_df, verif_cal_df) %>%
+  mutate(
+    treatment = if_else(treatment == "answer", "Answer", "Reasoning"),
+    parameter = factor(parameter, levels = c("Accuracy", "Criterion", "Discrimination", "Verification")),
+    panel = factor(
+      case_when(
+        parameter == "Accuracy" ~ "a  Accuracy",
+        parameter == "Criterion" ~ "b  Criterion",
+        parameter == "Discrimination" ~ "c  Discrimination",
+        parameter == "Verification" ~ "d  Verification"
+      ),
+      levels = c("a  Accuracy", "b  Criterion", "c  Discrimination", "d  Verification")
+    )
+  )
+
+p_cal_sdt <- ggplot(cal_plot_df, aes(x = treatment, y = estimate, color = treatment, group = 1)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", color = "gray50") +
+  geom_pointrange(aes(ymin = lower, ymax = upper), linewidth = 0.8) +
+  facet_wrap(~panel, scales = "free_y", nrow = 1) +
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = NULL,
+    y = "Predicted value at average calibration"
+  ) +
+  theme_minimal(base_size = 16, base_family = "Arial") +
+  theme(
+    text = element_text(family = "Arial", size = 16),
+    strip.text = element_text(face = "bold", hjust = 0, color = "black", size = 12),
+    legend.position = "none",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+
+windows()
+print(p_cal_sdt)
+ggsave("plot/fig_calibration_accuracy_criterion_discrimination_verification.jpg", p_cal_sdt, width = 10, height = 2.6, dpi = 300)
+```
+
+```{r}
+# 2 panel graph for reasoning and answer condition confidence and calibrations
+df_conf_cal <- df_final %>%
+  distinct(participant_id, treatment, raw_confidence_mean, brier_mean) %>%
+  mutate(calibration_better = 1 - brier_mean)
+
+df_conf_cal_summary <- df_conf_cal %>%
+  group_by(treatment) %>%
+  summarise(
+    conf_est = mean(raw_confidence_mean, na.rm = TRUE),
+    conf_se = sd(raw_confidence_mean, na.rm = TRUE) / sqrt(sum(!is.na(raw_confidence_mean))),
+    conf_lower = conf_est - 1.96 * conf_se,
+    conf_upper = conf_est + 1.96 * conf_se,
+    cal_est = mean(calibration_better, na.rm = TRUE),
+    cal_se = sd(calibration_better, na.rm = TRUE) / sqrt(sum(!is.na(calibration_better))),
+    cal_lower = pmax(0, cal_est - 1.96 * cal_se),
+    cal_upper = pmin(1, cal_est + 1.96 * cal_se),
+    .groups = "drop"
+  )
+
+plot_conf_cal <- bind_rows(
+  df_conf_cal_summary %>%
+    transmute(
+      treatment,
+      estimate = conf_est,
+      lower = conf_lower,
+      upper = conf_upper,
+      panel = "a  Raw Confidence"
+    ),
+  df_conf_cal_summary %>%
+    transmute(
+      treatment,
+      estimate = cal_est,
+      lower = cal_lower,
+      upper = cal_upper,
+      panel = "b  Calibration (Higher = Better)"
+    )
+) %>%
+  mutate(
+    treatment = if_else(treatment == "answer", "Answer", "Reasoning"),
+    panel = factor(panel, levels = c("a  Raw Confidence", "b  Calibration (Higher = Better)"))
+  )
+
+if (!exists("format_interval_label")) {
+  format_interval_label <- function(draws, digits = 2) {
+    q <- quantile(draws, c(0.025, 0.975), na.rm = TRUE)
+    sig_text <- if (q[1] > 0 || q[2] < 0) "95% CRI excl. 0" else "ns"
+    paste0(
+      sig_text,
+      "\n[",
+      round(q[1], digits),
+      ", ",
+      round(q[2], digits),
+      "]"
+    )
+  }
+}
+
+post_conf_main <- as_draws_df(m_conf)
+post_calib_main <- as_draws_df(m_calib)
+
+conf_cal_label_by_panel <- c(
+  "a  Raw Confidence" = format_interval_label(post_conf_main$b_treatmentreasoning),
+  "b  Calibration (Higher = Better)" = format_interval_label(-post_calib_main$b_treatmentreasoning)
+)
+
+sig_conf_cal_df <- tibble(
+  panel = factor(
+    c("a  Raw Confidence", "b  Calibration (Higher = Better)"),
+    levels = levels(plot_conf_cal$panel)
+  ),
+  x = "Answer",
+  y = Inf,
+  label = unname(conf_cal_label_by_panel)
+)
+
+p_conf_cal_2panel <- ggplot(plot_conf_cal, aes(x = treatment, y = estimate, color = treatment)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), linewidth = 0.8) +
+  geom_text(
+    data = sig_conf_cal_df,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    color = "black",
+    family = "Arial",
+    size = 3.0,
+    lineheight = 0.95,
+    vjust = 1.5
+  ) +
+  facet_wrap(~panel, scales = "free_y", nrow = 1) +
+  scale_y_continuous(expand = expansion(mult = c(0.35, 0.35))) +
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = NULL,
+    y = "Estimate"
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    text = element_text(family = "Arial", color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    strip.text = element_text(face = "bold", hjust = 0, color = "black"),
+    legend.position = "none",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+windows()
+p_conf_cal_2panel
+ggsave("plot/fig3_confidence_calibration_by_treatment.jpg", p_conf_cal_2panel, width = 6, height = 2, dpi = 300)
+```
+
+
+
+## RQ 3: Moderator Effects
+# How participant CRT correlate with performance in AI reasoning/answer conditions
+CRT by accuracy, acceptance behavior (criterion, discrimination), and error detection (verification) are all included in the 4-panel figure above. The SDT analysis is based on the latent probit scale, which is a common approach in signal detection theory to model binary outcomes. The criterion represents the threshold for deciding whether to accept or reject the AI's answer, while discrimination reflects the sensitivity to distinguishing between correct and incorrect AI answers. The error detection rate indicates how well participants can identify when the AI is incorrect.
+```{r}
+# CRT-focused analyses for core outcomes
+# 1) Accuracy by CRT
+m_acc_crt <- brm(
+  correct ~ treatment * crt_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_final,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+
+summary(m_acc_crt)
+save(m_acc_crt, file="models/m_acc_crt.RData")
+
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.12      0.20     0.76     1.53 1.00     1625     2526
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.20      0.15     0.01     0.55 1.00     1124     2045
+
+# Regression Coefficients:
+#                          Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                    0.49      0.35    -0.18     1.15 1.00     1874
+# treatmentreasoning           0.05      0.21    -0.36     0.46 1.00     5433
+# crt_z                        0.23      0.14    -0.05     0.52 1.00     3125
+# domainlegal                 -0.08      0.49    -1.05     0.88 1.00     1797
+# domainmath                  -0.15      0.49    -1.10     0.79 1.00     1790
+# domainmedical               -0.02      0.48    -0.95     0.91 1.00     1584
+# domainmisinfo               -0.10      0.48    -1.06     0.81 1.00     1855
+# treatmentreasoning:crt_z    -0.34      0.22    -0.78     0.08 1.00     3197
+#                          Tail_ESS
+# Intercept                    2056
+# treatmentreasoning           3249
+# crt_z                        2819
+# domainlegal                  1971
+# domainmath                   2600
+# domainmedical                2078
+# domainmisinfo                2524
+# treatmentreasoning:crt_z     2438
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+
+
+# 2) Acceptance behavior by CRT (SDT-style probit)
+df_sdt_crt <- df_final %>%
+  filter(!is.na(said_ai_correct), !is.na(ai_correct), !is.na(crt_z)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    ai_correct = as.integer(ai_correct),
+    treat_c = if_else(treatment == "reasoning", 0.5, -0.5),
+    ai_c = if_else(ai_correct == 1, 0.5, -0.5)
+  )
+
+m_accept_crt <- brm(
+  said_ai_correct ~ treat_c * ai_c + crt_z + treat_c:crt_z + ai_c:crt_z + domain +
+    (1 | participant_id) + (1 | item_id),
+  data = df_sdt_crt,
+  family = bernoulli(link = "probit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_accept_crt)
+save(m_accept_crt, file="models/m_accept_crt.RData")
+
+
+# > summary(m_accept_crt)
+#  Family: bernoulli 
+#   Links: mu = probit 
+# Formula: said_ai_correct ~ treat_c * ai_c + crt_z + treat_c:crt_z + ai_c:crt_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_sdt_crt (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.22      0.13     0.01     0.49 1.01      762     1292
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.46      0.13     0.20     0.71 1.00      612      910
+
+# Regression Coefficients:
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept         0.59      0.17     0.26     0.93 1.00     1933     2124
+# treat_c           0.72      0.17     0.41     1.07 1.00     3034     2813
+# ai_c              0.52      0.16     0.22     0.84 1.00     3337     2549
+# crt_z             0.01      0.08    -0.15     0.17 1.00     3495     3031
+# domainlegal      -0.15      0.22    -0.60     0.28 1.00     2537     2169
+# domainmath        0.08      0.23    -0.37     0.53 1.00     2601     2084
+# domainmedical     0.06      0.23    -0.36     0.51 1.00     2288     2247
+# domainmisinfo     0.01      0.23    -0.43     0.47 1.00     2509     2478
+# treat_c:ai_c      0.15      0.27    -0.38     0.67 1.00     4127     2720
+# treat_c:crt_z     0.35      0.16     0.04     0.68 1.00     2859     2882
+# ai_c:crt_z        0.12      0.13    -0.14     0.37 1.00     4880     3039
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+# 3) Error detection / verification by CRT
+m_error_detection_crt <- brm(
+  error_detection ~ treatment * crt_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_err_det,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_error_detection_crt)
+save(m_error_detection_crt, file="models/m_error_detection_crt.RData")
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 23) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.34      0.25     0.01     0.90 1.00     1119     1855
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.76      0.40     0.05     1.57 1.01      665     1450
+
+# Regression Coefficients:
+#                          Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                    0.02      0.35    -0.69     0.74 1.00     4006
+# treatmentreasoning          -0.97      0.35    -1.68    -0.30 1.00     4655
+# crt_z                        0.43      0.23    -0.02     0.89 1.00     4689
+# domainlegal                  0.11      0.45    -0.77     0.98 1.00     4996
+# domainmath                  -0.58      0.52    -1.62     0.43 1.00     5543
+# domainmedical                0.10      0.44    -0.76     0.94 1.00     4740
+# domainmisinfo               -0.10      0.46    -1.01     0.80 1.00     3966
+# treatmentreasoning:crt_z    -0.71      0.33    -1.37    -0.06 1.00     4000
+#                          Tail_ESS
+# Intercept                    2946
+# treatmentreasoning           2329
+# crt_z                        3069
+# domainlegal                  3178
+# domainmath                   2878
+# domainmedical                3564
+# domainmisinfo                2969
+# treatmentreasoning:crt_z     3116
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+# Posterior probabilities for CRT interactions
+post_acc_crt <- as_draws_df(m_acc_crt)
+cat("P(CRT interaction > 0) [accuracy]: ",
+    mean(post_acc_crt$`b_treatmentreasoning:crt_z` > 0), "\n")
+
+post_accept_crt <- as_draws_df(m_accept_crt)
+cat("P(treatment x CRT > 0) [acceptance]: ",
+    mean(post_accept_crt$`b_treat_c:crt_z` > 0), "\n")
+cat("P(ai correctness x CRT > 0) [acceptance]: ",
+    mean(post_accept_crt$`b_ai_c:crt_z` > 0), "\n")
+
+post_verif_crt <- as_draws_df(m_error_detection_crt)
+cat("P(CRT interaction > 0) [verification]: ",
+    mean(post_verif_crt$`b_treatmentreasoning:crt_z` > 0), "\n")
+
+```
+
+<!-- > # Posterior probabilities for CRT interactions
+> post_acc_crt <- as_draws_df(m_acc_crt)
+> post_accept_crt <- as_draws_df(m_accept_crt)
+> cat("P(treatment x CRT > 0) [acceptance]: ",
++     mean(post_accept_crt$`b_treat_c:crt_z` > 0), "\n")
+P(treatment x CRT > 0) [acceptance]:  0.9845 
+> cat("P(ai correctness x CRT > 0) [acceptance]: ",
++     mean(post_accept_crt$`b_ai_c:crt_z` > 0), "\n")
+P(ai correctness x CRT > 0) [acceptance]:  0.82325 
+> post_verif_crt <- as_draws_df(m_error_detection_crt)
+> cat("P(CRT interaction > 0) [verification]: ",
++     mean(post_verif_crt$`b_treatmentreasoning:crt_z` > 0), "\n")
+P(CRT interaction > 0) [verification]:  0.0155  -->
+
+
+```{r}
+# 4-panel CRT relationship plot: CRT on x-axis, Answer vs Reasoning lines
+crt_grid <- seq(-2, 2, length.out = 60)
+
+# Accuracy predictions from m_acc_crt
+nd_acc_crt <- expand.grid(
+  crt_z = crt_grid,
+  treatment = levels(df_final$treatment),
+  domain = levels(df_final$domain)[1],
+  stringsAsFactors = FALSE
+)
+draws_acc_crt <- posterior_epred(m_acc_crt, newdata = nd_acc_crt, re_formula = NA)
+acc_crt_df <- nd_acc_crt %>%
+  mutate(
+    estimate = apply(draws_acc_crt, 2, mean),
+    lower = apply(draws_acc_crt, 2, quantile, probs = 0.025),
+    upper = apply(draws_acc_crt, 2, quantile, probs = 0.975),
+    parameter = "Accuracy"
+  )
+
+# Verification predictions from m_error_detection_crt
+nd_verif_crt <- expand.grid(
+  crt_z = crt_grid,
+  treatment = levels(df_err_det$treatment),
+  domain = levels(df_err_det$domain)[1],
+  stringsAsFactors = FALSE
+)
+draws_verif_crt <- posterior_epred(m_error_detection_crt, newdata = nd_verif_crt, re_formula = NA)
+verif_crt_df <- nd_verif_crt %>%
+  mutate(
+    estimate = apply(draws_verif_crt, 2, mean),
+    lower = apply(draws_verif_crt, 2, quantile, probs = 0.025),
+    upper = apply(draws_verif_crt, 2, quantile, probs = 0.975),
+    parameter = "Verification"
+  )
+
+# Criterion and discrimination on latent probit scale from m_accept_crt
+nd_accept_crt <- expand.grid(
+  crt_z = crt_grid,
+  treatment = levels(df_final$treatment),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(treat_c = if_else(treatment == "reasoning", 0.5, -0.5))
+
+criterion_crt_df <- bind_rows(lapply(seq_len(nrow(nd_accept_crt)), function(i) {
+  crt_i <- nd_accept_crt$crt_z[i]
+  tc_i <- nd_accept_crt$treat_c[i]
+
+  crit_draw <- -(
+    post_accept_crt$b_Intercept +
+      post_accept_crt$b_crt_z * crt_i +
+      post_accept_crt$b_treat_c * tc_i +
+      post_accept_crt$`b_treat_c:crt_z` * tc_i * crt_i
+  )
+
+  tibble(
+    crt_z = crt_i,
+    treatment = nd_accept_crt$treatment[i],
+    estimate = mean(crit_draw),
+    lower = quantile(crit_draw, 0.025),
+    upper = quantile(crit_draw, 0.975),
+    parameter = "Criterion"
+  )
+}))
+
+discrimination_crt_df <- bind_rows(lapply(seq_len(nrow(nd_accept_crt)), function(i) {
+  crt_i <- nd_accept_crt$crt_z[i]
+  tc_i <- nd_accept_crt$treat_c[i]
+
+  discrim_draw <-
+    post_accept_crt$b_ai_c +
+    post_accept_crt$`b_ai_c:crt_z` * crt_i +
+    post_accept_crt$`b_treat_c:ai_c` * tc_i
+
+  tibble(
+    crt_z = crt_i,
+    treatment = nd_accept_crt$treatment[i],
+    estimate = mean(discrim_draw),
+    lower = quantile(discrim_draw, 0.025),
+    upper = quantile(discrim_draw, 0.975),
+    parameter = "Discrimination"
+  )
+}))
+
+crt_plot_df <- bind_rows(acc_crt_df, criterion_crt_df, discrimination_crt_df, verif_crt_df) %>%
+  mutate(
+    treatment = if_else(treatment == "answer", "Answer", "Reasoning"),
+    parameter = factor(parameter, levels = c("Accuracy", "Criterion", "Discrimination", "Verification")),
+    panel = factor(
+      case_when(
+        parameter == "Accuracy" ~ "a  Accuracy",
+        parameter == "Criterion" ~ "b  Criterion",
+        parameter == "Discrimination" ~ "c  Discrimination",
+        parameter == "Verification" ~ "d  Verification"
+      ),
+      levels = c("a  Accuracy", "b  Criterion", "c  Discrimination", "d  Verification")
+    )
+  )
+
+if (!exists("format_interval_label")) {
+  format_interval_label <- function(draws, digits = 2) {
+    q <- quantile(draws, c(0.025, 0.975), na.rm = TRUE)
+    sig_text <- if (q[1] > 0 || q[2] < 0) "95% CRI excl. 0" else "ns"
+    paste0(
+      sig_text,
+      "\n[",
+      round(q[1], digits),
+      ", ",
+      round(q[2], digits),
+      "]"
+    )
+  }
+}
+
+# Posterior interval labels for CRT effects by panel.
+crt_label_by_parameter <- c(
+  "Accuracy" = format_interval_label(post_acc_crt$`b_treatmentreasoning:crt_z`),
+  "Criterion" = format_interval_label(post_accept_crt$`b_treat_c:crt_z`),
+  "Discrimination" = format_interval_label(post_accept_crt$`b_ai_c:crt_z`),
+  "Verification" = format_interval_label(post_verif_crt$`b_treatmentreasoning:crt_z`)
+)
+
+sig_crt_df <- crt_plot_df %>%
+  group_by(parameter, panel) %>%
+  summarise(
+    x = max(crt_z, na.rm = TRUE) - 1.5,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    y = Inf,
+    label = unname(crt_label_by_parameter[as.character(parameter)])
+  )
+
+p_crt_sdt <- ggplot(crt_plot_df, aes(x = crt_z, y = estimate, color = treatment, fill = treatment)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_text(
+    data = sig_crt_df,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    color = "black",
+    family = "Arial",
+    size = 3.1,
+    lineheight = 0.95,
+    vjust = 0.1
+  ) +
+  facet_wrap(~panel, scales = "free_y", nrow = 1) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.28))) +
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  scale_fill_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = "CRT score (z)",
+    y = "Estimate"
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+  text = element_text(family = "Arial", size = 11, color = "black"),
+  axis.text = element_text(color = "black", size = 11),
+  axis.title = element_text(color = "black", size = 11),
+  strip.text = element_text(face = "bold", hjust = 0, color = "black", size = 11),
+  legend.text = element_text(color = "black", size = 11),
+  legend.title = element_blank(),
+  legend.position = "bottom",
+  panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+
+windows()
+p_crt_sdt
+ggsave("plot/fig4_crt_accuracy_criterion_discrimination_verification.jpg", p_crt_sdt, width = 10, height = 3, dpi = 300)
+```
+
+
+
+# Supplement
+# RQ3 moderation template: accuracy_measure ~ condition * participant_attribute + covariates + random_effects
+```{r}
+# Cleaned moderation dataframe shared by all RQ3 models.
+df_rq3_mod <- df_final %>%
+  mutate(
+    ai_truthful1_z = as.numeric(scale(ai_truthful1)),
+    ai_helpful1_z = as.numeric(scale(ai_helpful1)),
+    ai_confident1_z = as.numeric(scale(ai_confident1)),
+    trust_composite = rowMeans(cbind(ai_truthful1, ai_helpful1, ai_confident1), na.rm = TRUE),
+    trust_composite_z = as.numeric(scale(trust_composite)),
+    llm_use_frequency_z = as.numeric(llm_familiarity_z)
+  )
+
+df_sdt_mod <- df_rq3_mod %>%
+  filter(!is.na(said_ai_correct), !is.na(ai_correct)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    ai_correct = as.integer(ai_correct),
+    treat_c = if_else(treatment == "reasoning", 0.5, -0.5),
+    ai_c = if_else(ai_correct == 1, 0.5, -0.5)
+
+  )
+
+df_verif_mod <- df_rq3_mod %>%
+  filter(ai_correct == 0, !is.na(said_ai_correct), !is.na(treatment)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    error_detection = 1L - said_ai_correct
+  )
+
+df_cal_mod <- df_rq3_mod %>%
+  mutate(brier_trial = (confidence_prob - correct)^2)
+```
+
+```{r}
+# Prior knowledge
+m_mod_prior_acc <- brm(
+  correct ~ treatment * prior_knowledge_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_rq3_mod,
+  family = bernoulli(link = "logit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_prior_acc)
+save(m_mod_prior_acc, file = "models/m_mod_prior_acc.Rdata")
+
+
+# > summary(m_mod_prior_acc)
+#  Family: bernoulli 
+#   Links: mu = logit 
+# Formula: correct ~ treatment * prior_knowledge_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_rq3_mod (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.10      0.20     0.76     1.53 1.00     1432     1881
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.22      0.16     0.01     0.60 1.00      895     1517
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                                0.48      0.35    -0.21     1.16 1.00
+# treatmentreasoning                       0.04      0.22    -0.39     0.48 1.00
+# prior_knowledge_z                        0.18      0.15    -0.12     0.48 1.00
+# domainlegal                             -0.06      0.48    -0.98     0.86 1.00
+# domainmath                              -0.16      0.49    -1.13     0.81 1.00
+# domainmedical                           -0.03      0.47    -0.92     0.94 1.00
+# domainmisinfo                           -0.10      0.49    -1.02     0.86 1.00
+# treatmentreasoning:prior_knowledge_z    -0.17      0.21    -0.59     0.24 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                1347     2088
+# treatmentreasoning                       3211     2347
+# prior_knowledge_z                        2948     3008
+# domainlegal                              1574     2618
+# domainmath                               1350     2436
+# domainmedical                            1738     2268
+# domainmisinfo                            1505     2559
+# treatmentreasoning:prior_knowledge_z     2746     2616
+
+
+# prior knowledge, criterion
+m_mod_prior_sdt <- brm(
+  said_ai_correct ~ treat_c * ai_c + prior_knowledge_z + treat_c:prior_knowledge_z + ai_c:prior_knowledge_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_sdt_mod,
+  family = bernoulli(link = "probit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_prior_sdt)
+save(m_mod_prior_sdt, file = "models/m_mod_prior_sdt.RData")
+
+# > summary(m_mod_prior_sdt)
+#  Family: bernoulli 
+#   Links: mu = probit 
+# Formula: said_ai_correct ~ treat_c * ai_c + prior_knowledge_z + treat_c:prior_knowledge_z + ai_c:prior_knowledge_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_sdt_mod (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.22      0.13     0.01     0.49 1.00      917     1530
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.50      0.13     0.23     0.75 1.01     1049     1181
+
+# Regression Coefficients:
+#                           Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                     0.61      0.17     0.30     0.95 1.00     1987
+# treat_c                       0.72      0.17     0.39     1.05 1.00     2641
+# ai_c                          0.51      0.16     0.20     0.84 1.00     2993
+# prior_knowledge_z             0.02      0.09    -0.15     0.19 1.00     2614
+# domainlegal                  -0.14      0.22    -0.58     0.31 1.00     2350
+# domainmath                    0.09      0.23    -0.35     0.53 1.00     2681
+# domainmedical                 0.06      0.22    -0.38     0.49 1.00     2699
+# domainmisinfo                 0.05      0.22    -0.38     0.47 1.00     2485
+# treat_c:ai_c                  0.11      0.27    -0.42     0.64 1.00     4096
+# treat_c:prior_knowledge_z    -0.02      0.17    -0.36     0.31 1.00     2703
+# ai_c:prior_knowledge_z        0.16      0.14    -0.13     0.45 1.00     4379
+#                           Tail_ESS
+# Intercept                     1886
+# treat_c                       2285
+# ai_c                          2225
+# prior_knowledge_z             2278
+# domainlegal                   2157
+# domainmath                    2515
+# domainmedical                 2066
+# domainmisinfo                 2576
+# treat_c:ai_c                  2838
+# treat_c:prior_knowledge_z     2440
+# ai_c:prior_knowledge_z        2563
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+ 
+
+m_mod_prior_verif <- brm(
+  error_detection ~ treatment * prior_knowledge_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_verif_mod,
+  family = bernoulli(link = "logit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_prior_verif)
+save(m_mod_prior_verif, file = "models/m_mod_prior_verif.RData")
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 23) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.35      0.26     0.01     0.92 1.00      977     1633
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.00      0.41     0.16     1.80 1.01      482      597
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                               -0.02      0.37    -0.76     0.70 1.00
+# treatmentreasoning                      -1.02      0.38    -1.80    -0.29 1.00
+# prior_knowledge_z                        0.11      0.26    -0.39     0.62 1.00
+# domainlegal                              0.12      0.47    -0.81     1.03 1.00
+# domainmath                              -0.65      0.52    -1.69     0.36 1.00
+# domainmedical                            0.12      0.45    -0.78     1.03 1.00
+# domainmisinfo                           -0.14      0.48    -1.09     0.81 1.00
+# treatmentreasoning:prior_knowledge_z    -0.04      0.34    -0.73     0.61 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                2359     2612
+# treatmentreasoning                       2627     2373
+# prior_knowledge_z                        2119     2173
+# domainlegal                              2912     2490
+# domainmath                               2777     2462
+# domainmedical                            2359     1994
+# domainmisinfo                            2617     2604
+# treatmentreasoning:prior_knowledge_z     2216     2581
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+
+m_mod_prior_cal <- brm(
+  brier_trial ~ treatment * prior_knowledge_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_cal_mod,
+  family = gaussian(),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd"), prior(exponential(1), class = "sigma")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_prior_cal)
+save(m_mod_prior_cal, file = "models/m_mod_prior_cal.RData")
+
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.11      0.02     0.07     0.16 1.00     1311     1852
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.06      0.03     0.00     0.11 1.01      787     1222
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                                0.38      0.05     0.28     0.48 1.00
+# treatmentreasoning                       0.00      0.03    -0.06     0.07 1.00
+# prior_knowledge_z                       -0.06      0.02    -0.10    -0.01 1.00
+# domainlegal                             -0.10      0.07    -0.23     0.03 1.00
+# domainmath                              -0.02      0.07    -0.15     0.11 1.00
+# domainmedical                           -0.08      0.07    -0.22     0.06 1.00
+# domainmisinfo                           -0.10      0.07    -0.23     0.04 1.00
+# treatmentreasoning:prior_knowledge_z     0.07      0.03     0.01     0.14 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                1252     1927
+# treatmentreasoning                       2992     2693
+# prior_knowledge_z                        2256     1924
+# domainlegal                              1272     1712
+# domainmath                               1386     2364
+# domainmedical                            1349     2124
+# domainmisinfo                            1388     1898
+# treatmentreasoning:prior_knowledge_z     2369     1781
+
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     0.32      0.01     0.30     0.34 1.00     1639     2389
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+```
+
+```{r}
+# LLM use frequency
+m_mod_freq_acc <- brm(
+  correct ~ treatment * llm_use_frequency_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_rq3_mod,
+  family = bernoulli(link = "logit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_freq_acc)
+save(m_mod_freq_acc, file = "models/m_mod_freq_acc.Rdata")
+
+# > summary(m_mod_freq_acc)
+#  Family: bernoulli 
+#   Links: mu = logit 
+# Formula: correct ~ treatment * llm_use_frequency_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_rq3_mod (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.10      0.20     0.75     1.54 1.00     1689     2368
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.22      0.16     0.01     0.58 1.00     1179     1725
+
+# Regression Coefficients:
+#                                        Estimate Est.Error l-95% CI u-95% CI
+# Intercept                                  0.46      0.35    -0.24     1.12
+# treatmentreasoning                         0.06      0.21    -0.36     0.47
+# llm_use_frequency_z                       -0.05      0.14    -0.34     0.24
+# domainlegal                               -0.09      0.46    -0.98     0.81
+# domainmath                                -0.18      0.49    -1.13     0.81
+# domainmedical                             -0.04      0.49    -0.97     0.90
+# domainmisinfo                             -0.11      0.48    -1.05     0.84
+# treatmentreasoning:llm_use_frequency_z    -0.02      0.21    -0.43     0.39
+#                                        Rhat Bulk_ESS Tail_ESS
+# Intercept                              1.00     1839     2450
+# treatmentreasoning                     1.00     5215     3060
+# llm_use_frequency_z                    1.00     3520     2553
+# domainlegal                            1.00     1853     2365
+# domainmath                             1.00     1947     2511
+# domainmedical                          1.00     1878     2602
+# domainmisinfo                          1.00     1811     2415
+# treatmentreasoning:llm_use_frequency_z 1.00     3730     2900
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+m_mod_freq_sdt <- brm(
+  said_ai_correct ~ treat_c * ai_c + llm_use_frequency_z + treat_c:llm_use_frequency_z + ai_c:llm_use_frequency_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_sdt_mod,
+  family = bernoulli(link = "probit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_freq_sdt)
+save(m_mod_freq_sdt, file = "models/m_mod_freq_sdt.RData")
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.24      0.13     0.02     0.50 1.00      990     1240
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.51      0.12     0.26     0.76 1.00     1065     1202
+
+# Regression Coefficients:
+#                             Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                       0.61      0.17     0.28     0.97 1.00     2236
+# treat_c                         0.74      0.17     0.42     1.08 1.00     2936
+# ai_c                            0.51      0.17     0.19     0.85 1.00     3095
+# llm_use_frequency_z            -0.08      0.08    -0.25     0.07 1.00     2973
+# domainlegal                    -0.15      0.23    -0.61     0.30 1.00     2707
+# domainmath                      0.10      0.24    -0.38     0.56 1.00     2561
+# domainmedical                   0.07      0.23    -0.36     0.53 1.00     2549
+# domainmisinfo                   0.02      0.23    -0.44     0.48 1.00     2472
+# treat_c:ai_c                    0.19      0.28    -0.35     0.74 1.00     3747
+# treat_c:llm_use_frequency_z     0.02      0.16    -0.31     0.34 1.00     2685
+# ai_c:llm_use_frequency_z       -0.15      0.14    -0.42     0.12 1.00     4439
+#                             Tail_ESS
+# Intercept                       2602
+# treat_c                         2748
+# ai_c                            2346
+# llm_use_frequency_z             2765
+# domainlegal                     3193
+# domainmath                      2519
+# domainmedical                   2630
+# domainmisinfo                   2640
+# treat_c:ai_c                    3032
+# treat_c:llm_use_frequency_z     2770
+# ai_c:llm_use_frequency_z        3005
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+m_mod_freq_verif <- brm(
+  error_detection ~ treatment * llm_use_frequency_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_verif_mod,
+  family = bernoulli(link = "logit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_freq_verif)
+save(m_mod_freq_verif, file = "models/m_mod_freq_verif.RData")
+
+# Formula: error_detection ~ treatment * llm_use_frequency_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_verif_mod (Number of observations: 235) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 23) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.34      0.25     0.01     0.92 1.00      952     1442
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.98      0.42     0.12     1.81 1.01      414      460
+
+# Regression Coefficients:
+#                                        Estimate Est.Error l-95% CI u-95% CI
+# Intercept                                 -0.04      0.37    -0.76     0.68
+# treatmentreasoning                        -0.99      0.37    -1.75    -0.29
+# llm_use_frequency_z                        0.05      0.23    -0.41     0.51
+# domainlegal                                0.12      0.44    -0.74     0.99
+# domainmath                                -0.68      0.52    -1.74     0.36
+# domainmedical                              0.11      0.44    -0.74     0.98
+# domainmisinfo                             -0.12      0.47    -1.03     0.80
+# treatmentreasoning:llm_use_frequency_z    -0.04      0.37    -0.75     0.68
+#                                        Rhat Bulk_ESS Tail_ESS
+# Intercept                              1.00     2351     2699
+# treatmentreasoning                     1.00     2400     2266
+# llm_use_frequency_z                    1.00     1884     2234
+# domainlegal                            1.00     2738     2787
+# domainmath                             1.00     3034     2587
+# domainmedical                          1.00     2809     2833
+# domainmisinfo                          1.00     2544     2605
+# treatmentreasoning:llm_use_frequency_z 1.00     2263     2355
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+# > save(m_mod_freq_verif, file = "models/m_mod_freq_verif.RData")
+
+m_mod_freq_cal <- brm(
+  brier_trial ~ treatment * llm_use_frequency_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_cal_mod,
+  family = gaussian(),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd"), prior(exponential(1), class = "sigma")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_freq_cal)
+save(m_mod_freq_cal, file = "models/m_mod_freq_cal.RData")
+#  Family: gaussian 
+#   Links: mu = identity 
+# Formula: brier_trial ~ treatment * llm_use_frequency_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_cal_mod (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.11      0.02     0.06     0.16 1.00     1336     2164
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.06      0.03     0.01     0.12 1.00      803     1329
+
+# Regression Coefficients:
+#                                        Estimate Est.Error l-95% CI u-95% CI
+# Intercept                                  0.39      0.05     0.29     0.49
+# treatmentreasoning                        -0.00      0.03    -0.07     0.06
+# llm_use_frequency_z                        0.03      0.02    -0.01     0.08
+# domainlegal                               -0.10      0.07    -0.23     0.02
+# domainmath                                -0.02      0.07    -0.16     0.11
+# domainmedical                             -0.08      0.07    -0.21     0.05
+# domainmisinfo                             -0.10      0.07    -0.23     0.04
+# treatmentreasoning:llm_use_frequency_z    -0.02      0.03    -0.08     0.05
+#                                        Rhat Bulk_ESS Tail_ESS
+# Intercept                              1.00     1951     2188
+# treatmentreasoning                     1.00     4434     2688
+# llm_use_frequency_z                    1.00     3785     2657
+# domainlegal                            1.00     2051     2399
+# domainmath                             1.00     2012     2192
+# domainmedical                          1.00     2127     2467
+# domainmisinfo                          1.00     2011     2375
+# treatmentreasoning:llm_use_frequency_z 1.00     3201     2747
+
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     0.32      0.01     0.30     0.34 1.00     2361     2933
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+```
+
+```{r}
+# LLM familiarity
+m_mod_familiarity_acc <- brm(
+  correct ~ treatment * llm_familiarity_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_rq3_mod,
+  family = bernoulli(link = "logit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_familiarity_acc)
+save(m_mod_familiarity_acc, file = "models/m_mod_familiarity_acc.RData")
+
+# summary(m_mod_familiarity_acc)
+#  Family: bernoulli 
+#   Links: mu = logit 
+# Formula: correct ~ treatment * llm_familiarity_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_rq3_mod (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.11      0.20     0.76     1.54 1.00     1375     2030
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.22      0.16     0.01     0.58 1.00     1033     1488
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                                0.45      0.36    -0.23     1.17 1.00
+# treatmentreasoning                       0.07      0.21    -0.35     0.48 1.00
+# llm_familiarity_z                       -0.05      0.14    -0.31     0.23 1.00
+# domainlegal                             -0.08      0.49    -1.07     0.86 1.00
+# domainmath                              -0.19      0.49    -1.14     0.78 1.00
+# domainmedical                           -0.04      0.48    -0.97     0.93 1.00
+# domainmisinfo                           -0.12      0.48    -1.06     0.84 1.00
+# treatmentreasoning:llm_familiarity_z    -0.02      0.21    -0.41     0.39 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                1539     2184
+# treatmentreasoning                       3787     3021
+# llm_familiarity_z                        2730     2735
+# domainlegal                              1531     2005
+# domainmath                               1419     2167
+# domainmedical                            1748     2283
+# domainmisinfo                            1686     2399
+# treatmentreasoning:llm_familiarity_z     2748     2693
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+
+m_mod_familiarity_sdt <- brm(
+  said_ai_correct ~ treat_c * ai_c + llm_familiarity_z + treat_c:llm_familiarity_z + ai_c:llm_familiarity_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_sdt_mod,
+  family = bernoulli(link = "probit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_familiarity_sdt)
+save(m_mod_familiarity_sdt, file = "models/m_mod_familiarity_sdt.RData")
+
+#  Family: bernoulli 
+#   Links: mu = probit 
+# Formula: said_ai_correct ~ treat_c * ai_c + llm_familiarity_z + treat_c:llm_familiarity_z + ai_c:llm_familiarity_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_sdt_mod (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.23      0.13     0.02     0.51 1.01      651     1454
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.51      0.12     0.26     0.76 1.00     1101     1182
+
+# Regression Coefficients:
+#                           Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                     0.61      0.17     0.28     0.97 1.00     2113
+# treat_c                       0.75      0.18     0.41     1.10 1.00     3003
+# ai_c                          0.51      0.16     0.20     0.84 1.00     3438
+# llm_familiarity_z            -0.09      0.08    -0.25     0.08 1.00     3218
+# domainlegal                  -0.15      0.23    -0.60     0.30 1.00     2570
+# domainmath                    0.09      0.24    -0.37     0.57 1.00     2601
+# domainmedical                 0.07      0.23    -0.39     0.51 1.00     2338
+# domainmisinfo                 0.01      0.23    -0.44     0.47 1.00     2654
+# treat_c:ai_c                  0.19      0.27    -0.37     0.71 1.00     5609
+# treat_c:llm_familiarity_z     0.01      0.17    -0.32     0.34 1.00     3081
+# ai_c:llm_familiarity_z       -0.16      0.13    -0.42     0.11 1.00     4205
+#                           Tail_ESS
+# Intercept                     2304
+# treat_c                       2831
+# ai_c                          2712
+# llm_familiarity_z             3032
+# domainlegal                   2504
+# domainmath                    2443
+# domainmedical                 2376
+# domainmisinfo                 2439
+# treat_c:ai_c                  2883
+# treat_c:llm_familiarity_z     2662
+# ai_c:llm_familiarity_z        2919
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+m_mod_familiarity_verif <- brm(
+  error_detection ~ treatment * llm_familiarity_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_verif_mod,
+  family = bernoulli(link = "logit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_familiarity_verif)
+save(m_mod_familiarity_verif, file = "models/m_mod_familiarity_verif.RData")
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 23) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.35      0.25     0.01     0.93 1.00     1230     2109
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.97      0.42     0.08     1.80 1.00      531      375
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                               -0.03      0.38    -0.82     0.72 1.00
+# treatmentreasoning                      -1.00      0.36    -1.74    -0.31 1.00
+# llm_familiarity_z                        0.05      0.24    -0.43     0.52 1.00
+# domainlegal                              0.12      0.45    -0.77     1.00 1.00
+# domainmath                              -0.68      0.52    -1.72     0.35 1.00
+# domainmedical                            0.11      0.46    -0.78     1.02 1.01
+# domainmisinfo                           -0.11      0.49    -1.09     0.84 1.00
+# treatmentreasoning:llm_familiarity_z    -0.03      0.37    -0.76     0.72 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                2120     1369
+# treatmentreasoning                       3258     2442
+# llm_familiarity_z                        2466     2324
+# domainlegal                              3232     1947
+# domainmath                               3944     2751
+# domainmedical                            2360     1768
+# domainmisinfo                            2389     1498
+# treatmentreasoning:llm_familiarity_z     2846     2603
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+m_mod_familiarity_cal <- brm(
+  brier_trial ~ treatment * llm_familiarity_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_cal_mod,
+  family = gaussian(),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd"), prior(exponential(1), class = "sigma")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_familiarity_cal)
+save(m_mod_familiarity_cal, file = "models/m_mod_familiarity_cal.RData")
+# summary(m_mod_familiarity_cal)
+#  Family: gaussian 
+#   Links: mu = identity 
+# Formula: brier_trial ~ treatment * llm_familiarity_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_cal_mod (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.11      0.02     0.06     0.16 1.00     1164     1754
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.06      0.03     0.01     0.12 1.01      736     1360
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                                0.39      0.05     0.29     0.49 1.00
+# treatmentreasoning                      -0.00      0.03    -0.07     0.06 1.00
+# llm_familiarity_z                        0.03      0.02    -0.01     0.08 1.00
+# domainlegal                             -0.10      0.07    -0.23     0.04 1.00
+# domainmath                              -0.02      0.07    -0.16     0.11 1.00
+# domainmedical                           -0.07      0.07    -0.20     0.06 1.00
+# domainmisinfo                           -0.09      0.07    -0.23     0.05 1.00
+# treatmentreasoning:llm_familiarity_z    -0.02      0.03    -0.08     0.05 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                1555     2014
+# treatmentreasoning                       4281     3023
+# llm_familiarity_z                        2863     2852
+# domainlegal                              1660     2052
+# domainmath                               1644     1981
+# domainmedical                            1679     2327
+# domainmisinfo                            1703     2033
+# treatmentreasoning:llm_familiarity_z     2766     2694
+
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     0.32      0.01     0.30     0.34 1.00     1941     2914
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+```
+
+```{r}
+# AI trust questions
+trust_vars <- c(
+  "ai_truthful1",
+  "ai_helpful1",
+  "ai_confident1"
+)
+
+# Fit PCA on complete cases, standardizing each variable
+trust_complete <- complete.cases(df_final[, trust_vars])
+
+trust_pca <- prcomp(
+  df_final[trust_complete, trust_vars],
+  center = TRUE,
+  scale. = TRUE
+)
+
+# Inspect PC1
+trust_pca$rotation[, 1]              # component weights
+summary(trust_pca)                   # variance explained
+
+trust_pc1 <- rep(NA_real_, nrow(df_final))
+trust_pc1[trust_complete] <- trust_pca$x[, 1]
+
+# Orient so higher values mean greater trust
+if (sum(trust_pca$rotation[, 1]) < 0) {
+  trust_pc1 <- -trust_pc1
+}
+
+df_rq3_mod <- df_final %>%
+  mutate(
+    ai_truthful1_z = as.numeric(scale(ai_truthful1)),
+    ai_helpful1_z = as.numeric(scale(ai_helpful1)),
+    ai_confident1_z = as.numeric(scale(ai_confident1)),
+
+    trust_composite = trust_pc1,
+    trust_composite_z = as.numeric(scale(trust_composite)),
+
+    llm_use_frequency_z = if_else(
+      is.na(llm_familiarity_z),
+      as.numeric(scale(avg_confidence)),
+      llm_familiarity_z
+    )
+  )
+
+# add composite trust scores for regression models
+df_sdt_mod <- df_rq3_mod %>%
+  filter(!is.na(said_ai_correct), !is.na(ai_correct)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    ai_correct = as.integer(ai_correct),
+    treat_c = if_else(treatment == "reasoning", 0.5, -0.5),
+    ai_c = if_else(ai_correct == 1, 0.5, -0.5)
+  )
+
+df_verif_mod <- df_rq3_mod %>%
+  filter(ai_correct == 0, !is.na(said_ai_correct), !is.na(treatment)) %>%
+  mutate(
+    said_ai_correct = as.integer(said_ai_correct),
+    error_detection = 1L - said_ai_correct
+  )
+
+
+trust_pca$rotation[, 1]
+trust_pca$sdev[1]^2 / sum(trust_pca$sdev^2)
+#________________________________________________________________
+df_rq3_mod %>%
+  summarise(
+    n_total = n(),
+    n_complete = sum(complete.cases(
+      correct,
+      treatment,
+      trust_composite_z,
+      domain,
+      participant_id,
+      item_id
+    ))
+  )
+
+m_mod_trust_acc <- brm(
+  correct ~ treatment * trust_composite_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_rq3_mod,
+  family = bernoulli(link = "logit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_trust_acc)
+save(m_mod_trust_acc, file = "models/m_mod_trust_acc.RData")
+
+#  Family: bernoulli 
+#   Links: mu = probit 
+# Formula: said_ai_correct ~ treat_c * ai_c + trust_composite_z + treat_c:trust_composite_z + ai_c:trust_composite_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_sdt_mod (Number of observations: 500) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.22      0.13     0.01     0.48 1.00      838     1547
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.48      0.13     0.21     0.72 1.00     1262     1377
+
+# Regression Coefficients:
+#                           Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                     0.59      0.17     0.27     0.93 1.00     1776
+# treat_c                       0.75      0.17     0.42     1.08 1.00     2429
+# ai_c                          0.50      0.16     0.20     0.82 1.00     2672
+# trust_composite_z             0.10      0.09    -0.08     0.29 1.00     2499
+# domainlegal                  -0.14      0.22    -0.58     0.30 1.00     2233
+# domainmath                    0.09      0.23    -0.37     0.55 1.00     2060
+# domainmedical                 0.07      0.23    -0.40     0.51 1.00     2225
+# domainmisinfo                 0.02      0.22    -0.45     0.44 1.00     1932
+# treat_c:ai_c                  0.07      0.28    -0.47     0.62 1.00     3683
+# treat_c:trust_composite_z    -0.15      0.18    -0.50     0.20 1.00     2615
+# ai_c:trust_composite_z       -0.21      0.14    -0.50     0.06 1.00     3368
+#                           Tail_ESS
+# Intercept                     2263
+# treat_c                       2360
+# ai_c                          2013
+# trust_composite_z             2554
+# domainlegal                   2677
+# domainmath                    2058
+# domainmedical                 2262
+# domainmisinfo                 2501
+# treat_c:ai_c                  3035
+# treat_c:trust_composite_z     2721
+# ai_c:trust_composite_z        2695
+
+
+m_mod_trust_sdt <- brm(
+  said_ai_correct ~ treat_c * ai_c + trust_composite_z + treat_c:trust_composite_z + ai_c:trust_composite_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_sdt_mod,
+  family = bernoulli(link = "probit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_trust_sdt)
+save(m_mod_trust_sdt, file = "models/m_mod_trust_sdt.RData")
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.23      0.12     0.02     0.48 1.00     1051     1883
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.47      0.13     0.18     0.72 1.00      903      803
+
+# Regression Coefficients:
+#                           Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                     0.59      0.17     0.26     0.93 1.00     2319
+# treat_c                       0.75      0.17     0.43     1.09 1.00     3429
+# ai_c                          0.50      0.16     0.20     0.82 1.00     3677
+# trust_composite_z             0.10      0.09    -0.08     0.28 1.00     3110
+# domainlegal                  -0.14      0.22    -0.58     0.28 1.00     3084
+# domainmath                    0.09      0.23    -0.36     0.57 1.00     3095
+# domainmedical                 0.06      0.23    -0.38     0.53 1.00     2733
+# domainmisinfo                 0.00      0.22    -0.42     0.46 1.00     2952
+# treat_c:ai_c                  0.06      0.27    -0.50     0.59 1.00     5029
+# treat_c:trust_composite_z    -0.16      0.18    -0.50     0.20 1.00     3265
+# ai_c:trust_composite_z       -0.21      0.14    -0.48     0.06 1.00     4812
+#                           Tail_ESS
+# Intercept                     2418
+# treat_c                       3048
+# ai_c                          2782
+# trust_composite_z             2782
+# domainlegal                   2368
+# domainmath                    2743
+# domainmedical                 2746
+# domainmisinfo                 2900
+# treat_c:ai_c                  2916
+# treat_c:trust_composite_z     2920
+# ai_c:trust_composite_z        2156
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+m_mod_trust_verif <- brm(
+  error_detection ~ treatment * trust_composite_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_verif_mod,
+  family = bernoulli(link = "logit"),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_trust_verif)
+save(m_mod_trust_verif, file = "models/m_mod_trust_verif.RData")
+# > summary(m_mod_trust_verif)
+#  Family: bernoulli 
+#   Links: mu = logit 
+# Formula: error_detection ~ treatment * trust_composite_z + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_verif_mod (Number of observations: 235) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 23) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.33      0.25     0.01     0.91 1.00     1444     2388
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.88      0.41     0.08     1.69 1.00      629      887
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                                0.06      0.37    -0.64     0.80 1.00
+# treatmentreasoning                      -1.11      0.38    -1.90    -0.38 1.00
+# trust_composite_z                       -0.48      0.28    -1.03     0.08 1.00
+# domainlegal                              0.12      0.46    -0.79     1.03 1.00
+# domainmath                              -0.69      0.50    -1.68     0.29 1.00
+# domainmedical                            0.10      0.45    -0.79     0.96 1.00
+# domainmisinfo                           -0.12      0.46    -1.08     0.76 1.00
+# treatmentreasoning:trust_composite_z     0.23      0.35    -0.47     0.92 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                5207     3023
+# treatmentreasoning                       4559     2482
+# trust_composite_z                        4400     3297
+# domainlegal                              6102     3188
+# domainmath                               5679     3389
+# domainmedical                            5644     3093
+# domainmisinfo                            5389     3205
+# treatmentreasoning:trust_composite_z     4027     3082
+
+
+m_mod_trust_cal <- brm(
+  brier_trial ~ treatment * trust_composite_z + domain + (1 | participant_id) + (1 | item_id),
+  data = df_cal_mod,
+  family = gaussian(),
+  prior = c(prior(normal(0, 1), class = "b"), prior(normal(0, 1.5), class = "Intercept"), prior(exponential(1), class = "sd"), prior(exponential(1), class = "sigma")),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_trust_cal)
+save(m_mod_trust_cal, file = "models/m_mod_trust_cal.RData")
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.11      0.02     0.06     0.16 1.00     1388     1648
+
+# ~participant_id (Number of levels: 100) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.07      0.03     0.01     0.12 1.00      780      980
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                                0.39      0.05     0.28     0.49 1.00
+# treatmentreasoning                       0.00      0.03    -0.06     0.07 1.00
+# trust_composite_z                        0.02      0.03    -0.03     0.09 1.00
+# domainlegal                             -0.10      0.07    -0.24     0.04 1.00
+# domainmath                              -0.03      0.07    -0.16     0.11 1.00
+# domainmedical                           -0.08      0.07    -0.21     0.06 1.00
+# domainmisinfo                           -0.10      0.07    -0.23     0.04 1.00
+# treatmentreasoning:trust_composite_z    -0.03      0.04    -0.11     0.03 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                1959     2189
+# treatmentreasoning                       3965     2895
+# trust_composite_z                        2888     2664
+# domainlegal                              2123     2476
+# domainmath                               2227     2241
+# domainmedical                            1804     2474
+# domainmisinfo                            2206     2564
+# treatmentreasoning:trust_composite_z     2833     2674
+
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     0.32      0.01     0.30     0.34 1.00     2216     2706
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+```
+
+# Plot models
+```{r}
+
+# Build one faceted panel plot for moderator interaction models:
+# rows = moderators, columns = Accuracy / Criterion / Discrimination / Verification
+
+build_moderator_panel_df <- function(moderator_label, x_var, x_grid,
+                                     m_acc, m_sdt, m_verif,
+                                     treatment_levels, domain_ref) {
+  # Accuracy predictions
+  nd_acc <- expand.grid(
+    x_value = x_grid,
+    treatment = treatment_levels,
+    domain = domain_ref,
+    stringsAsFactors = FALSE
+  ) %>%
+    rename(!!x_var := x_value)
+
+  draws_acc <- posterior_epred(m_acc, newdata = nd_acc, re_formula = NA)
+
+  acc_df <- nd_acc %>%
+    mutate(
+      estimate = apply(draws_acc, 2, mean),
+      lower = apply(draws_acc, 2, quantile, probs = 0.025),
+      upper = apply(draws_acc, 2, quantile, probs = 0.975),
+      metric = "Accuracy"
+    ) %>%
+    transmute(
+      moderator = moderator_label,
+      metric,
+      x_value = .data[[x_var]],
+      treatment,
+      estimate,
+      lower,
+      upper
+    )
+
+  # Verification predictions
+  nd_verif <- expand.grid(
+    x_value = x_grid,
+    treatment = treatment_levels,
+    domain = domain_ref,
+    stringsAsFactors = FALSE
+  ) %>%
+    rename(!!x_var := x_value)
+
+  draws_verif <- posterior_epred(m_verif, newdata = nd_verif, re_formula = NA)
+
+  verif_df <- nd_verif %>%
+    mutate(
+      estimate = apply(draws_verif, 2, mean),
+      lower = apply(draws_verif, 2, quantile, probs = 0.025),
+      upper = apply(draws_verif, 2, quantile, probs = 0.975),
+      metric = "Verification"
+    ) %>%
+    transmute(
+      moderator = moderator_label,
+      metric,
+      x_value = .data[[x_var]],
+      treatment,
+      estimate,
+      lower,
+      upper
+    )
+
+  # SDT latent draws for criterion and discrimination
+  post_sdt <- as_draws_df(m_sdt)
+  b_x <- paste0("b_", x_var)
+  b_treat_x <- paste0("b_treat_c:", x_var)
+  b_ai_x <- paste0("b_ai_c:", x_var)
+
+  nd_sdt <- expand.grid(
+    x_value = x_grid,
+    treatment = treatment_levels,
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(treat_c = if_else(treatment == "reasoning", 0.5, -0.5))
+
+  criterion_df <- bind_rows(lapply(seq_len(nrow(nd_sdt)), function(i) {
+    x_i <- nd_sdt$x_value[i]
+    tc_i <- nd_sdt$treat_c[i]
+
+    crit_draw <- -(
+      post_sdt$b_Intercept +
+        post_sdt[[b_x]] * x_i +
+        post_sdt$b_treat_c * tc_i +
+        post_sdt[[b_treat_x]] * tc_i * x_i
+    )
+
+    tibble(
+      moderator = moderator_label,
+      metric = "Criterion",
+      x_value = x_i,
+      treatment = nd_sdt$treatment[i],
+      estimate = mean(crit_draw),
+      lower = quantile(crit_draw, 0.025),
+      upper = quantile(crit_draw, 0.975)
+    )
+  }))
+
+  discrimination_df <- bind_rows(lapply(seq_len(nrow(nd_sdt)), function(i) {
+    x_i <- nd_sdt$x_value[i]
+    tc_i <- nd_sdt$treat_c[i]
+
+    discrim_draw <-
+      post_sdt$b_ai_c +
+      post_sdt[[b_ai_x]] * x_i +
+      post_sdt$`b_treat_c:ai_c` * tc_i
+
+    tibble(
+      moderator = moderator_label,
+      metric = "Discrimination",
+      x_value = x_i,
+      treatment = nd_sdt$treatment[i],
+      estimate = mean(discrim_draw),
+      lower = quantile(discrim_draw, 0.025),
+      upper = quantile(discrim_draw, 0.975)
+    )
+  }))
+
+  bind_rows(acc_df, criterion_df, discrimination_df, verif_df)
+}
+
+mod_x <- seq(-2, 2, length.out = 60)
+mod_treatment_levels <- levels(df_final$treatment)
+mod_domain_ref <- levels(df_final$domain)[1]
+
+panel_prior <- build_moderator_panel_df(
+  moderator_label = "Prior Knowledge (z)",
+  x_var = "prior_knowledge_z",
+  x_grid = mod_x,
+  m_acc = m_mod_prior_acc,
+  m_sdt = m_mod_prior_sdt,
+  m_verif = m_mod_prior_verif,
+  treatment_levels = mod_treatment_levels,
+  domain_ref = mod_domain_ref
+)
+
+panel_freq <- build_moderator_panel_df(
+  moderator_label = "LLM Use Frequency (z)",
+  x_var = "llm_use_frequency_z",
+  x_grid = mod_x,
+  m_acc = m_mod_freq_acc,
+  m_sdt = m_mod_freq_sdt,
+  m_verif = m_mod_freq_verif,
+  treatment_levels = mod_treatment_levels,
+  domain_ref = mod_domain_ref
+)
+
+panel_familiarity <- build_moderator_panel_df(
+  moderator_label = "LLM Familiarity (z)",
+  x_var = "llm_familiarity_z",
+  x_grid = mod_x,
+  m_acc = m_mod_familiarity_acc,
+  m_sdt = m_mod_familiarity_sdt,
+  m_verif = m_mod_familiarity_verif,
+  treatment_levels = mod_treatment_levels,
+  domain_ref = mod_domain_ref
+)
+
+# CRT row uses the already-fitted CRT interaction models above.
+panel_crt <- build_moderator_panel_df(
+  moderator_label = "CRT (z)",
+  x_var = "crt_z",
+  x_grid = mod_x,
+  m_acc = m_acc_crt,
+  m_sdt = m_accept_crt,
+  m_verif = m_error_detection_crt,
+  treatment_levels = mod_treatment_levels,
+  domain_ref = mod_domain_ref
+)
+
+panel_trust <- build_moderator_panel_df(
+  moderator_label = "Trust Composite (z)",
+  x_var = "trust_composite_z",
+  x_grid = mod_x,
+  m_acc = m_mod_trust_acc,
+  m_sdt = m_mod_trust_sdt,
+  m_verif = m_mod_trust_verif,
+  treatment_levels = mod_treatment_levels,
+  domain_ref = mod_domain_ref
+)
+
+panel_all <- bind_rows(
+  panel_prior,
+  panel_freq,
+  panel_familiarity,
+  panel_crt,
+  panel_trust
+) %>%
+  mutate(
+    treatment = if_else(treatment == "answer", "Answer", "Reasoning"),
+    metric = factor(metric, levels = c("Accuracy", "Criterion", "Discrimination", "Verification")),
+    moderator = factor(
+      moderator,
+      levels = c(
+        "Prior Knowledge (z)",
+        "LLM Use Frequency (z)",
+        "LLM Familiarity (z)",
+        "CRT (z)",
+        "Trust Composite (z)"
+      )
+    )
+  )
+
+p_mod_grid <- ggplot(panel_all, aes(x = x_value, y = estimate, color = treatment, fill = treatment)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 0.95) +
+  facet_grid(
+    rows = vars(moderator),
+    cols = vars(metric),
+    scales = "free_y",
+    labeller = labeller(
+      moderator = c(
+        "LLM Use Frequency (z)" = "LLM Use\nFrequency (z)"
+      )
+    )
+  ) +
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  scale_fill_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = "Moderator value (z)",
+    y = "Estimate",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    text = element_text(family = "Arial", size = 11, color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    strip.text = element_text(face = "bold", color = "black"),
+    legend.text = element_text(color = "black"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4)
+  )
+windows()
+print(p_mod_grid)
+ggsave("plot/fig_rq3_moderator_interaction_panel.jpg", p_mod_grid, width = 7, height = 7, dpi = 300)
+
+```
+
+
+
+
+# Interaction with time.
+We can use time as a proxy of individual deliberation effort
+```{r}
+# Add time column to long format data
+add_time_to_long <- function(df_wide, df_long) {
+  time_cols <- grep("_time$", names(df_wide), value = TRUE)
+  
+  df_time <- df_wide %>%
+    select(prolific_id, all_of(time_cols)) %>%
+    pivot_longer(cols = -prolific_id, names_to = "time_raw", values_to = "time_spent") %>%
+    mutate(item_id = str_remove(time_raw, "_time")) %>%
+    select(-time_raw)
+  
+  df_long %>% left_join(df_time, by = c("prolific_id", "item_id"))
+}
+
+# Add time to both conditions
+df1_long <- add_time_to_long(df1, df1_long)
+df2_long <- add_time_to_long(df2, df2_long)
+
+# Recombine with time
+df_time <- bind_rows(df1_long, df2_long) %>%
+  filter(!is.na(time_spent), time_spent > 0) %>%
+  mutate(
+    domain = factor(domain),
+    participant_id = factor(participant_id),
+    item_id = factor(item_id),
+    treatment = factor(treatment, levels = c("answer", "reasoning")),
+    crt_z = scale(crt_score)[,1],
+    log_time = log(time_spent)
+  )
+
+cat("Time analysis sample:", nrow(df_time), "observations\n")
+```
+
+```{r}
+# Model 1: Does reasoning condition increase time spent?
+m_time <- brm(
+  log(time_spent) ~ treatment + (1|participant_id) + (1|item_id),
+  data = df_time,
+  cores = 4, chains = 4
+)
+summary(m_time)
+```
+
+ <!-- Family: gaussian 
+  Links: mu = identity 
+Formula: log(time_spent) ~ treatment + (1 | participant_id) + (1 | item_id) 
+   Data: df_final (Number of observations: 500) 
+  Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1; -->
+         <!-- total post-warmup draws = 4000
+
+Multilevel Hyperparameters:
+~item_id (Number of levels: 50) 
+              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sd(Intercept)     0.24      0.04     0.17     0.33 1.00     1864     2712
+
+~participant_id (Number of levels: 100) 
+              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sd(Intercept)     0.52      0.05     0.44     0.62 1.00     1194     2080
+
+Regression Coefficients:
+                   Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+Intercept              5.07      0.09     4.89     5.24 1.00     1376     2050
+treatmentreasoning     0.27      0.12     0.04     0.49 1.00     1339     2006
+
+Further Distributional Parameters:
+      Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sigma     0.55      0.02     0.51     0.60 1.00     3517     3502
+
+Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+and Tail_ESS are effective sample size measures, and Rhat is the potential
+scale reduction factor on split chains (at convergence, Rhat = 1). -->
+
+
+
+```{r}
+# Model 2: Does reasoning change CRT-deliberation relationship?
+m_time_crt <- brm(
+  log(time_spent) ~ treatment * crt_z + (1|participant_id) + (1|item_id),
+  data = df_time,
+  cores = 4, chains = 4
+)
+summary(m_time_crt)
+```
+
+<!-- summary(m_time_crt)
+ Family: gaussian 
+  Links: mu = identity 
+Formula: log(time_spent) ~ treatment * crt_z + (1 | participant_id) + (1 | item_id) 
+   Data: df_final (Number of observations: 500) 
+  Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+         total post-warmup draws = 4000
+
+Multilevel Hyperparameters:
+~item_id (Number of levels: 50) 
+              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sd(Intercept)     0.24      0.04     0.17     0.33 1.00     1246     2247
+
+~participant_id (Number of levels: 100) 
+              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sd(Intercept)     0.51      0.05     0.42     0.61 1.00     1347     2022
+
+Regression Coefficients:
+                         Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+Intercept                    5.09      0.09     4.92     5.26 1.00     1022
+treatmentreasoning           0.25      0.11     0.03     0.47 1.00     1077
+crt_z                        0.18      0.08     0.03     0.33 1.00      966
+treatmentreasoning:crt_z    -0.19      0.12    -0.42     0.05 1.00      987
+                         Tail_ESS
+Intercept                    1918
+treatmentreasoning           1785
+crt_z                        1562
+treatmentreasoning:crt_z     1326
+
+Further Distributional Parameters:
+      Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sigma     0.55      0.02     0.51     0.60 1.00     2919     2926
+
+Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+and Tail_ESS are effective sample size measures, and Rhat is the potential
+scale reduction factor on split chains (at convergence, Rhat = 1). -->
+
+
+```{r}
+# Model 3: Does deliberation (time) improve accuracy?
+m_time_accuracy <- brm(
+  correct ~ treatment * log(time_spent) + (1|participant_id) + (1|item_id),
+  family = bernoulli(),
+  data = df_time,
+  cores = 4, chains = 4
+)
+summary(m_time_accuracy)
+
+df_sdt_time <- df_sdt_mod %>%
+  left_join(
+    df_time %>%
+      select(participant_id, item_id, treatment, log_time),
+    by = c("participant_id", "item_id", "treatment")
+  ) %>%
+  mutate(log_time_z = as.numeric(scale(log_time))) %>%
+  filter(!is.na(log_time_z))
+
+# SDT of time
+m_mod_time_sdt <- brm(
+  said_ai_correct ~ treat_c * ai_c +
+    log_time_z +
+    treat_c:log_time_z +
+    ai_c:log_time_z +
+    domain +
+    (1 | participant_id) + (1 | item_id),
+  data = df_sdt_time,
+  family = bernoulli(link = "probit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_mod_time_sdt)
+```
+
+
+
+
+## Trust and Overreliance Analysis
+```{r}
+# Test whether baseline trust moderates overreliance under reasoning
+# Overreliance = accepting AI when AI is incorrect
+df_overreliance <- df_final %>%
+  filter(ai_correct == 0) %>%
+  mutate(
+    overreliance = 1 - correct,  # 1 = accepted incorrect AI, 0 = rejected incorrect AI
+    baseline_trust = (ai_truthful1 + ai_helpful1 + ai_confident1) / 3,
+    baseline_trust_z = as.numeric(scale(baseline_trust))
+  )
+summary(df_overreliance$baseline_trust_z)
+# reasoning condition has slightly higher trust than answer condition
+# data:  baseline_trust_z by treatment
+# t = -13.914, df = 252.75, p-value < 2.2e-16
+# alternative hypothesis: true difference in means between group answer and group reasoning is not equal to 0
+# 95 percent confidence interval:
+#  -1.491346 -1.121522
+# sample estimates:
+#    mean in group answer mean in group reasoning 
+#              -0.6734718               0.6329622 
+
+
+#check trust separately by condition
+summary(df_overreliance %>% filter(treatment == "answer") %>% pull(baseline_trust_z))
+summary(df_overreliance %>% filter(treatment == "reasoning") %>% pull(baseline_trust_z))
+
+# statistical test for how trust in AI differ by condition
+t.test(baseline_trust_z ~ treatment, data = df_overreliance)
+
+m_baseline_trust <- brm(
+  overreliance ~ treatment * baseline_trust_z + (1|participant_id) + (1|item_id),
+  data = df_overreliance,
+  family = bernoulli(),
+  chains = 4, cores = 4
+)
+summary(m_baseline_trust)
+
+# Formula: overreliance ~ treatment * baseline_trust_z + (1 | participant_id) + (1 | item_id)
+#    Data: df_overreliance (Number of observations: 258)
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 25)
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.39      0.26     0.02     0.98 1.00     1027     1582
+
+# ~participant_id (Number of levels: 100)
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     1.03      0.38     0.26     1.81 1.00      798     1097
+
+# Regression Coefficients:
+#                                     Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                              -0.29      0.40    -1.13     0.47 1.00
+# treatmentreasoning                      1.45      0.52     0.49     2.57 1.00
+# baseline_trust_z                       -0.54      0.41    -1.40     0.22 1.00
+# treatmentreasoning:baseline_trust_z     0.86      0.54    -0.16     1.98 1.00
+#                                     Bulk_ESS Tail_ESS
+# Intercept                               1450     1556
+# treatmentreasoning                      1913     1548
+# baseline_trust_z                        1713     1347
+# treatmentreasoning:baseline_trust_z     1775     1476
+# Plot: Predicted probability of overreliance vs baseline trust
+
+nd_trust <- expand.grid(
+  baseline_trust_z = seq(-2, 2, length = 50),
+  treatment = levels(df_overreliance$treatment)
+)
+
+pred_trust <- fitted(m_baseline_trust, newdata = nd_trust, re_formula = NA)
+nd_trust$prob <- pred_trust[,1]
+nd_trust$prob_lwr <- pred_trust[,3]
+nd_trust$prob_upr <- pred_trust[,4]
+
+p_overrel_trust <- ggplot(nd_trust, aes(x = baseline_trust_z, y = prob, color = treatment, fill = treatment)) +
+  geom_ribbon(aes(ymin = prob_lwr, ymax = prob_upr), alpha = 0.2, color = NA) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = c("answer" = "#ff7f0e", "reasoning" = "#1f77b4")) +
+  scale_fill_manual(values = c("answer" = "#ff7f0e", "reasoning" = "#1f77b4")) +
+  labs(
+    x = "Baseline Trust (z-scored)",
+    y = "Predicted Probability of Overreliance",
+    color = "Condition",
+    fill = "Condition"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5)
+  )
+windows()
+print(p_overrel_trust)
+ggsave("plot/overreliance_baseline_trust.jpeg", p_overrel_trust, width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
+# Test whether reasoning condition increases post-task trust
+trust_vars_pre <- c("ai_truthful1", "ai_helpful1", "ai_confident1")
+trust_vars_post <- c("ai_truthful2", "ai_helpful2", "ai_confident2")
+
+df_trust <- df_final %>%
+  select(participant_id, treatment, all_of(trust_vars_pre), all_of(trust_vars_post)) %>%
+  distinct() %>%
+  mutate(
+    pre_trust = (ai_truthful1 + ai_helpful1 + ai_confident1) / 3,
+    post_trust = (ai_truthful2 + ai_helpful2 + ai_confident2) / 3,
+    trust_change = post_trust - pre_trust
+  )
+
+
+t.test(df_trust$trust_change ~ df_trust$treatment)
+#no significance in trust change by condition,t = 0.507, pval = 0.614
+
+m_post_trust <- brm(
+  post_trust ~ treatment + pre_trust + (1|participant_id),
+  data = df_trust
+)
+summary(m_post_trust)
+```
+<!-- Multilevel Hyperparameters:
+# ~participant_id (Number of levels: 102)
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.36      0.19     0.02     0.66 1.09       35       56
+
+# Regression Coefficients:
+#                    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept              0.86      0.17     0.53     1.19 1.02      254      231
+# treatmentreasoning     0.45      0.18     0.11     0.82 1.02      236       96
+# pre_trust              0.67      0.07     0.53     0.81 1.02      220      114
+
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     0.49      0.15     0.19     0.71 1.10       33       33
+ -->
+
+
+
+
+
+# ----------------------------------------------------------------------------------------------------
+## Justification Analysis
+```{r}
+# Load labeled justification data
+df_justification <- read_csv("C:\\Users\\joice\\MSRA\\reasoning\\data\\justification_responses\\human_justifications_gpt4o_labeled_clean.csv")
+head(df_justification)
+length(unique(df_justification$response_id))
+
+# filter for only response ids that are in the main dataset
+df_justification <- df_justification %>%
+  filter(response_id %in% c(df1$response_id, df2$response_id))
+
+length(unique(df_justification$response_id))
+head(df_justification)
+# Merge with main dataset by response_id
+head(df_final)
+
+df_just_analysis <- df_final %>%
+  left_join(df_justification, by = "response_id") %>%
+  filter(!is.na(J1_primary))
+
+colnames(df_final)
+head(df_final)
+```
+
+```{r}
+# Logistic regression: Does condition predict each binarized J1 category?
+# J1 categories (numeric codes):
+#   1 = Knowledge-retrieval
+#   2 = Logic-based
+#   3 = Feature-based
+#   4 = Authority-based
+#   5 = Assertion-only (incl. recoded 6)
+#   6 = None/NA (incl. recoded 7)
+#
+# J1 is multilabel — binarize each category from the raw J1 column (e.g. "2,5")
+
+library(tidyverse)
+library(broom)
+library(lme4)
+
+# Load labeled data
+df_j1_raw <- read_csv("C:\\Users\\joice\\MSRA\\reasoning\\data\\justification_responses\\human_justifications_gpt4o_labeled_clean.csv") %>%
+  filter(!is.na(J1), !is.na(condition)) %>%
+  filter(response_id %in% c(df1$response_id, df2$response_id))
+
+length(unique(df_j1_raw$response_id))
+
+# Recode: 6->5 (Assertion-only), 7->6 (None/NA)
+recode_j1_val <- function(x) {
+  x <- as.integer(x)
+  case_when(x == 6 ~ 5L, x == 7 ~ 6L, TRUE ~ x)
+}
+
+# Expand multilabel J1 into binary indicator columns per response
+j1_labels <- c(
+  "1" = "Knowledge",
+  "2" = "Logic",
+  "3" = "Feature",
+  "4" = "Authority",
+  "5" = "Assertion",
+  "6" = "None"
+
+)
+
+df_j1_binary <- df_j1_raw %>%
+  mutate(
+    j1_codes = str_split(as.character(J1), ",")
+  ) %>%
+  mutate(j1_codes = map(j1_codes, ~ recode_j1_val(trimws(.x)))) %>%
+  mutate(across(
+    .cols = starts_with("condition"),
+    .fns = ~ .x
+  ))
+
+# Add binary indicator for each category
+for (code in names(j1_labels)) {
+  col_name <- j1_labels[[code]]
+  df_j1_binary[[col_name]] <- as.integer(
+    map_lgl(df_j1_binary$j1_codes, ~ as.integer(code) %in% .x)
+  )
+}
+
+# Condition as factor (answer = reference)
+df_j1_binary <- df_j1_binary %>%
+  mutate(condition_f = factor(condition, levels = c("Answer", "Reasoning")))
+
+cat("Sample sizes by condition:\n")
+print(table(df_j1_binary$condition_f))
+
+cat("\nJ1 category prevalence by condition:\n")
+df_j1_binary %>%
+  group_by(condition_f) %>%
+  summarise(across(all_of(unname(j1_labels)), mean, .names = "{.col}_prop"), n = n()) %>%
+  print()
+
+# --- Logistic regression: condition -> each J1 category ---
+# Mixed-effects logistic regression with participant random intercept
+results_list <- list()
+
+for (cat_name in unname(j1_labels)) {
+  formula_str <- paste0(cat_name, " ~ condition_f + (1 | participant_id)")
+  
+  tryCatch({
+    m <- glmer(as.formula(formula_str),
+               data = df_j1_binary,
+               family = binomial(link = "logit"),
+               control = glmerControl(optimizer = "bobyqa"))
+    
+    coef_df <- tidy(m, effects = "fixed", conf.int = TRUE) %>%
+      filter(term == "condition_fReasoning") %>%
+      mutate(
+        category = cat_name,
+        OR = exp(estimate),
+        OR_lwr = exp(conf.low),
+        OR_upr = exp(conf.high),
+        sig = case_when(p.value < .001 ~ "***",
+                        p.value < .01  ~ "**",
+                        p.value < .05  ~ "*",
+                        TRUE           ~ "ns")
+      )
+    results_list[[cat_name]] <- coef_df
+    
+  }, error = function(e) {
+    message("Could not fit model for ", cat_name, ": ", e$message)
+  })
+}
+
+head(results_list)
+j_category_n <- tibble(
+  category = unname(j1_labels),
+  n = map_int(unname(j1_labels), ~ sum(df_j1_binary[[.x]] == 1, na.rm = TRUE))
+) %>%
+  mutate(category_n = paste0(category, " (n = ", n, ")"))
+
+results_df <- bind_rows(results_list) %>%
+  select(category, estimate, std.error, statistic, p.value, OR, OR_lwr, OR_upr, sig) %>%
+  left_join(j_category_n, by = "category")
+
+cat("\n", strrep("=", 70), "\n")
+cat("LOGISTIC REGRESSION: Condition -> J1 Category (Reasoning vs Answer)\n")
+cat("Reference: Answer condition | Random intercept by participant\n")
+cat(strrep("=", 70), "\n")
+print(results_df %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  rename(
+    Category = category_n, `Log-OR` = estimate, SE = std.error,
+    z = statistic, p = p.value, `p-sig` = sig
+  ),
+  n = Inf)
+```
+<!-- 
+  category  `Log-OR`    SE      z     p    OR OR_lwr OR_upr `p-sig`     n
+  <chr>        <dbl> <dbl>  <dbl> <dbl> <dbl>  <dbl>  <dbl> <chr>   <dbl>
+1 Knowledge    0.097 0.345  0.282 0.778 1.10   0.561  2.16  ns         48
+2 Logic        0.178 0.252  0.706 0.48  1.20   0.729  1.96  ns        105
+3 Feature      0.063 0.245  0.258 0.797 1.06   0.659  1.72  ns         84
+4 Authority   -0.447 1.00  -0.445 0.656 0.64   0.089  4.58  ns         19
+5 Assertion   -0.622 0.305 -2.04  0.041 0.537  0.295  0.976 *          77   -->
+
+```{r}
+# Logistic regression: Does condition predict each binarized E category?
+# E categories
+# E is single-label — binarize each category directly
+
+e_labels <- c("E1" = "Analytic",
+               "E2" = "Intuitive",
+               "E3" = "Metacognitive")
+
+df_e_binary <- df_j1_raw %>%
+  filter(!is.na(E), !is.na(condition)) %>%
+  mutate(condition_f = factor(condition, levels = c("Answer", "Reasoning")))
+
+# Add binary indicator for each E category
+for (code in names(e_labels)) {
+  df_e_binary[[e_labels[[code]]]] <- as.integer(df_e_binary$E == code)
+}
+
+cat("Sample sizes by condition:\n")
+print(table(df_e_binary$condition_f))
+
+cat("\nE category prevalence by condition:\n")
+df_e_binary %>%
+  group_by(condition_f) %>%
+  summarise(across(all_of(unname(e_labels)), mean, .names = "{.col}_prop"), n = n()) %>%
+  print()
+
+# --- Mixed-effects logistic regression: condition -> each E category ---
+e_results_list <- list()
+
+for (cat_name in unname(e_labels)) {
+  formula_str <- paste0(cat_name, " ~ condition_f")
+
+  tryCatch({
+    m <- glm(
+      as.formula(formula_str),
+      data = df_e_binary,
+      family = binomial(link = "logit")
+    )
+
+    coef_df <- tidy(m, conf.int = TRUE) %>%
+      filter(term == "condition_fReasoning") %>%
+      mutate(
+        category = cat_name,
+        OR = exp(estimate),
+        OR_lwr = exp(conf.low),
+        OR_upr = exp(conf.high),
+        sig = case_when(
+          p.value < .001 ~ "***",
+          p.value < .01  ~ "**",
+          p.value < .05  ~ "*",
+          TRUE           ~ "ns"
+        )
+      )
+
+    e_results_list[[cat_name]] <- coef_df
+
+  }, error = function(e) {
+    message("Could not fit model for ", cat_name, ": ", e$message)
+  })
+}
+
+summary(m)
+head(e_results_list)
+e_category_n <- tibble(
+  category = unname(e_labels),
+  n = map_int(unname(e_labels), ~ sum(df_e_binary[[.x]] == 1, na.rm = TRUE))
+) %>%
+  mutate(category_n = paste0(category, " (n = ", n, ")"))
+
+e_results_df <- bind_rows(e_results_list) %>%
+  select(category, estimate, std.error, statistic, p.value, OR, OR_lwr, OR_upr, sig) %>%
+  left_join(e_category_n, by = "category")
+
+cat("\n", strrep("=", 70), "\n")
+cat("LOGISTIC REGRESSION: Condition -> E Category (Reasoning vs Answer)\n")
+cat("Reference: Answer condition | Random intercept by participant\n")
+cat(strrep("=", 70), "\n")
+print(e_results_df %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  rename(
+    Category = category_n, `Log-OR` = estimate, SE = std.error,
+    z = statistic, p = p.value, `p-sig` = sig
+  ),
+  n = Inf)
+```
+<!-- 
+# A tibble: 3 × 9
+  Category      `Log-OR`    SE      z     p    OR OR_lwr OR_upr `p-sig`
+  <chr>            <dbl> <dbl>  <dbl> <dbl> <dbl>  <dbl>  <dbl> <chr>  
+1 Analytic         0.43  0.179  2.40  0.017 1.54   1.08   2.19  *      
+2 Intuitive        0.053 0.232  0.226 0.821 1.05   0.668  1.66  ns     
+3 Metacognitive   -0.573 0.202 -2.84  0.004 0.564  0.378  0.835 **   
+ -->
+
+```{r}
+# Combined forest plot, figure for qualitative analysis
+forest_df <- bind_rows(
+  results_df %>%
+    transmute(panel = "a Justification Categories", category, n, OR, OR_lwr, OR_upr, sig),
+  e_results_df %>%
+    transmute(panel = "b Engagement Categories", category, n, OR, OR_lwr, OR_upr, sig)
+) %>%
+  group_by(panel) %>%
+  arrange(OR, .by_group = TRUE) %>%
+  mutate(category_panel = factor(category, levels = unique(category))) %>%
+  ungroup() %>%
+  mutate(panel = factor(panel, levels = c("a Justification Categories", "b Engagement Categories")))
+
+p_forest_je <- ggplot(forest_df, aes(x = OR, y = category_panel)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.2) +
+  geom_errorbarh(aes(xmin = OR_lwr, xmax = OR_upr), height = 0.25, linewidth = 0.2) +
+  geom_point(size = 3, color = "#1f77b4") +
+  geom_text(
+    aes(label = paste0("(n = ", n, ")"), x = OR_upr - 0.3),
+    hjust = 0,
+    nudge_y = 0.18,
+    size = 3.2,
+    family = "Arial"
+  ) +
+  geom_text(
+    aes(label = sig, x = OR_upr - 0.3),
+    hjust = 0,
+    nudge_y = - 0.2,
+    size = 3.2,
+    family = "Arial"
+  ) +
+  facet_wrap(~panel, scales = "free_y", nrow = 1) +
+  scale_x_continuous(limits = c(0, 6)) +
+  labs(
+    x = "Odds Ratio (Reasoning vs Answer)",
+    y = "Category"
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    text = element_text(family = "Arial", size = 11, color = "black"),
+    axis.text = element_text(color = "black", size = 11),
+    axis.title = element_text(color = "black", size = 11),
+    strip.text = element_text(hjust = 0, color = "black", size = 11, face = "bold"),
+    legend.position = "none",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+
+windows()
+p_forest_je
+ggsave("plot/fig5_je_category_forest_combined.jpg", p_forest_je, width = 8.2, height = 2.8, dpi = 300)
+```
+
+<!-- ```{r}
+
+# Combined 4-panel plot, figure for qualitative analysis
+panel_levels_je <- c(
+  "a Justification Category Distribution (%)",
+  "b Engagement Category Distribution (%)",
+  "c Justification Category Odds Ratios",
+  "d Engagement Category Odds Ratios"
+)
+
+je_colors <- c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")
+
+theme_je <- theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    text = element_text(family = "Arial", size = 11, color = "black"),
+    axis.text = element_text(color = "black", size = 11),
+    axis.title = element_text(color = "black", size = 11),
+    plot.title = element_text(hjust = 0, color = "black", size = 11, face = "bold"),
+    legend.position = "none",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+
+j_dist_df <- map_dfr(unname(j1_labels), function(cat_name) {
+  df_j1_binary %>%
+    group_by(condition_f) %>%
+    summarise(
+      estimate = mean(.data[[cat_name]], na.rm = TRUE),
+      n = sum(!is.na(.data[[cat_name]])),
+      se = sqrt(estimate * (1 - estimate) / n),
+      lower = pmax(0, estimate - 1.96 * se),
+      upper = pmin(1, estimate + 1.96 * se),
+      .groups = "drop"
+    ) %>%
+    mutate(category = cat_name)
+}) %>%
+  left_join(j_category_n, by = "category") %>%
+  mutate(
+    estimate = estimate * 100,
+    lower = lower * 100,
+    upper = upper * 100,
+    treatment = as.character(condition_f),
+    panel = "a Justification Category Distribution (%)"
+  )
+
+j_dist_levels <- j_dist_df %>%
+  group_by(category_n) %>%
+  summarise(order_value = max(estimate, na.rm = TRUE), .groups = "drop") %>%
+  arrange(order_value) %>%
+  pull(category_n)
+
+j_dist_df <- j_dist_df %>%
+  mutate(
+    category_n = factor(category_n, levels = j_dist_levels),
+    treatment = factor(treatment, levels = c("Answer", "Reasoning"))
+  )
+
+e_dist_df <- map_dfr(unname(e_labels), function(cat_name) {
+  df_e_binary %>%
+    group_by(condition_f) %>%
+    summarise(
+      estimate = mean(.data[[cat_name]], na.rm = TRUE),
+      n = sum(!is.na(.data[[cat_name]])),
+      se = sqrt(estimate * (1 - estimate) / n),
+      lower = pmax(0, estimate - 1.96 * se),
+      upper = pmin(1, estimate + 1.96 * se),
+      .groups = "drop"
+    ) %>%
+    mutate(category = cat_name)
+}) %>%
+  left_join(e_category_n, by = "category") %>%
+  mutate(
+    estimate = estimate * 100,
+    lower = lower * 100,
+    upper = upper * 100,
+    treatment = as.character(condition_f),
+    panel = "b Engagement Category Distribution (%)"
+  )
+
+e_dist_levels <- e_dist_df %>%
+  group_by(category_n) %>%
+  summarise(order_value = max(estimate, na.rm = TRUE), .groups = "drop") %>%
+  arrange(order_value) %>%
+  pull(category_n)
+
+e_dist_df <- e_dist_df %>%
+  mutate(
+    category_n = factor(category_n, levels = e_dist_levels),
+    treatment = factor(treatment, levels = c("Answer", "Reasoning"))
+  )
+
+j_forest_df <- results_df %>%
+  transmute(category_n, OR, OR_lwr, OR_upr, sig) %>%
+  mutate(category_n = factor(category_n, levels = rev(j_dist_levels)))
+
+e_forest_df <- e_results_df %>%
+  transmute(category_n, OR, OR_lwr, OR_upr, sig) %>%
+  mutate(category_n = factor(category_n, levels = rev(e_dist_levels)))
+
+p_j_dist <- ggplot(j_dist_df, aes(x = category_n, y = estimate, fill = treatment, color = treatment)) +
+  geom_col(
+    width = 0.65,
+    alpha = 0.85,
+    position = position_dodge(width = 0.75)
+  ) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.2,
+    linewidth = 0.8,
+    position = position_dodge(width = 0.75)
+  ) +
+  scale_color_manual(values = je_colors) +
+  scale_fill_manual(values = je_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = panel_levels_je[1],
+    x = NULL,
+    y = "Percent",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_je +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1),
+    axis.title.y = element_text(margin = margin(r = 6))
+  )
+
+p_e_dist <- ggplot(e_dist_df, aes(x = category_n, y = estimate, fill = treatment, color = treatment)) +
+  geom_col(
+    width = 0.65,
+    alpha = 0.85,
+    position = position_dodge(width = 0.75)
+  ) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.2,
+    linewidth = 0.8,
+    position = position_dodge(width = 0.75)
+  ) +
+  scale_color_manual(values = je_colors) +
+  scale_fill_manual(values = je_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = panel_levels_je[2],
+    x = NULL,
+    y = "Percent",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_je +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1),
+    axis.title.y = element_text(margin = margin(r = 6))
+  )
+
+p_j_forest <- ggplot(j_forest_df, aes(x = OR, y = category_n)) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "gray50",
+    linewidth = 0.4
+  ) +
+  geom_errorbarh(
+    aes(xmin = OR_lwr, xmax = OR_upr),
+    height = 0.25,
+    linewidth = 0.8,
+    color = "#1f77b4"
+  ) +
+  geom_point(
+    size = 3,
+    color = "#1f77b4"
+  ) +
+  geom_text(
+    aes(x = OR_upr + 0.05, label = sig),
+    hjust = 0,
+    size = 4,
+    family = "Arial"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.14))) +
+  labs(
+    title = panel_levels_je[3],
+    x = "Odds Ratio (Reasoning vs Answer)",
+    y = "Category",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_je
+
+p_e_forest <- ggplot(e_forest_df, aes(x = OR, y = category_n)) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "gray50",
+    linewidth = 0.4
+  ) +
+  geom_errorbarh(
+    aes(xmin = OR_lwr, xmax = OR_upr),
+    height = 0.25,
+    linewidth = 0.8,
+    color = "#1f77b4"
+  ) +
+  geom_point(
+    size = 3,
+    color = "#1f77b4"
+  ) +
+  geom_text(
+    aes(x = OR_upr + 0.05, label = sig),
+    hjust = 0,
+    size = 4,
+    family = "Arial"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.14))) +
+  labs(
+    title = panel_levels_je[4],
+    x = "Odds Ratio (Reasoning vs Answer)",
+    y = "Category",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_je
+
+p_legend_je <- ggplot(j_dist_df, aes(x = category_n, y = estimate, fill = treatment)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  scale_fill_manual(values = je_colors) +
+  guides(fill = guide_legend(nrow = 1)) +
+  theme_void() +
+  theme(
+    legend.position = "top",
+    legend.justification = "left",
+    legend.title = element_blank(),
+    legend.text = element_text(family = "Arial", size = 11, color = "black")
+  )
+
+legend_grob_je <- gtable::gtable_filter(ggplotGrob(p_legend_je), "guide-box")
+
+draw_p_forest_je <- function() {
+  grid::grid.newpage()
+  layout_je <- grid::grid.layout(
+    nrow = 2,
+    ncol = 4,
+    heights = grid::unit.c(grid::grobHeight(legend_grob_je) + grid::unit(0.15, "cm"), grid::unit(1, "null"))
+  )
+
+  grid::pushViewport(grid::viewport(layout = layout_je))
+  grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 1:4))
+  grid::grid.draw(legend_grob_je)
+  grid::popViewport()
+
+  print(p_j_dist, vp = grid::viewport(layout.pos.row = 2, layout.pos.col = 1))
+  print(p_e_dist, vp = grid::viewport(layout.pos.row = 2, layout.pos.col = 2))
+  print(p_j_forest, vp = grid::viewport(layout.pos.row = 2, layout.pos.col = 3))
+  print(p_e_forest, vp = grid::viewport(layout.pos.row = 2, layout.pos.col = 4))
+  grid::popViewport()
+}
+
+windows()
+draw_p_forest_je()
+jpeg("plot/fig_je_category_forest_combined.jpg", width = 16, height = 6.5, units = "in", res = 300)
+draw_p_forest_je()
+dev.off()
+``` -->
+
+
+# J and E difference by confidence/calibration
+```{r}
+# J is multilabel; fit one multivariable confidence model with all binary J indicators.
+# E is mutually exclusive, so model E as a factor.
+
+j_label_cols <- unname(j1_labels)
+e_levels <- c("E1", "E2", "E3")
+
+df_label_analysis <- df_just_analysis %>%
+  filter(!is.na(confidence), !is.na(correct), !is.na(treatment), !is.na(row_idx)) %>%
+  mutate(
+    confidence_prob = pmin(pmax((as.numeric(confidence) - 1) / 4, 0), 1),
+    brier_trial = (confidence_prob - correct)^2,
+    E = factor(E, levels = e_levels)
+  )
+
+df_j_label_analysis <- df_label_analysis %>%
+  left_join(
+    df_j1_binary %>% select(row_idx, all_of(j_label_cols)),
+    by = "row_idx"
+  )
+
+# J models: one multivariable model per outcome (all J binaries together)
+j_predictors <- paste(j_label_cols, collapse = " + ")
+j_formula_conf <- as.formula(paste0(
+  "confidence ~ treatment * (", j_predictors, ") + domain + (1 | participant_id) + (1 | item_id)"
+))
+j_formula_cal <- as.formula(paste0(
+  "brier_trial ~ treatment * (", j_predictors, ") + domain + (1 | participant_id) + (1 | item_id)"
+))
+
+m_j_conf <- brm(
+  j_formula_conf,
+  data = df_j_label_analysis,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 5), class = "Intercept"),
+    prior(exponential(1), class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_j_conf)
+
+# ultilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.15      0.08     0.01     0.32 1.00      880     1626
+
+# ~participant_id (Number of levels: 102) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.74      0.08     0.60     0.90 1.00     1236     2334
+
+# Regression Coefficients:
+#                              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# Intercept                        2.87      0.18     2.50     3.22 1.00     1740
+# treatmentreasoning               0.27      0.21    -0.15     0.70 1.00     1660
+# Knowledge                       -0.35      0.23    -0.77     0.11 1.00     3265
+# Logic                            0.20      0.20    -0.20     0.59 1.00     2797
+# Feature                         -0.27      0.20    -0.66     0.13 1.00     2714
+# Authority                       -0.18      0.32    -0.82     0.45 1.00     3634
+# Assertion                       -0.03      0.19    -0.42     0.36 1.00     2580
+# None                             0.00      0.97    -1.89     1.89 1.00     6240
+# domainlegal                      0.80      0.16     0.49     1.11 1.00     2690
+# domainmath                      -0.21      0.17    -0.55     0.11 1.00     2860
+# domainmedical                    0.02      0.16    -0.28     0.32 1.00     3178
+# domainmisinfo                    0.60      0.16     0.29     0.92 1.00     2939
+# treatmentreasoning:Knowledge     0.96      0.34     0.31     1.62 1.00     3344
+# treatmentreasoning:Logic         0.13      0.27    -0.40     0.67 1.00     2602
+# treatmentreasoning:Feature      -0.04      0.28    -0.58     0.50 1.00     2907
+# treatmentreasoning:Authority     0.09      0.47    -0.86     1.03 1.00     3581
+# treatmentreasoning:Assertion    -0.20      0.29    -0.78     0.36 1.00     2898
+# treatmentreasoning:None         -0.02      0.99    -1.97     1.94 1.00     6370
+#                              Tail_ESS
+# Intercept                        2326
+# treatmentreasoning               2352
+# Knowledge                        3363
+# Logic                            2845
+# Feature                          3293
+# Authority                        3217
+# Assertion                        2972
+# None                             3001
+# domainlegal                      2775
+# domainmath                       2513
+# domainmedical                    3203
+# domainmisinfo                    3009
+# treatmentreasoning:Knowledge     3268
+# treatmentreasoning:Logic         3065
+# treatmentreasoning:Feature       2763
+# treatmentreasoning:Authority     3098
+# treatmentreasoning:Assertion     2688
+# treatmentreasoning:None          2589
+
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     1.00      0.04     0.93     1.07 1.00     2718     2920
+
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+
+m_j_cal <- brm(
+  j_formula_cal,
+  data = df_j_label_analysis,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_j_cal)
+
+# E models: one multivariable model per outcome
+df_e_label_analysis <- df_label_analysis %>%
+  filter(!is.na(E))
+
+e_formula_conf <- confidence ~ treatment * E + domain + (1 | participant_id) + (1 | item_id)
+e_formula_cal <- brier_trial ~ treatment * E + domain + (1 | participant_id) + (1 | item_id)
+
+m_e_conf <- brm(
+  e_formula_conf,
+  data = df_e_label_analysis,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 5), class = "Intercept"),
+    prior(exponential(1), class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_e_conf)
+
+# > summary(m_e_conf)
+#  Family: gaussian 
+#   Links: mu = identity 
+# Formula: confidence ~ treatment * E + domain + (1 | participant_id) + (1 | item_id) 
+#    Data: df_e_label_analysis (Number of observations: 509) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 50) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.09      0.06     0.00     0.23 1.00     1010     1534
+
+# ~participant_id (Number of levels: 102) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.63      0.06     0.51     0.76 1.01     1218     1963
+
+# # Regression Coefficients:
+# #                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS
+# # Intercept                  3.44      0.14     3.15     3.71 1.00     1514
+# # treatmentreasoning         0.29      0.17    -0.03     0.63 1.00     1314
+# # EE2                        0.02      0.17    -0.32     0.35 1.00     2599
+# # EE3                       -1.45      0.14    -1.73    -1.18 1.00     2593
+# # domainlegal                0.38      0.13     0.13     0.65 1.00     2389
+# # domainmath                -0.01      0.13    -0.27     0.24 1.00     2644
+# # domainmedical             -0.06      0.13    -0.33     0.19 1.00     2615
+# # domainmisinfo              0.25      0.13    -0.00     0.51 1.00     2334
+# # treatmentreasoning:EE2    -0.44      0.24    -0.88     0.04 1.00     2490
+# # treatmentreasoning:EE3    -0.03      0.21    -0.43     0.36 1.00     2673
+# #                        Tail_ESS
+# # Intercept                  2164
+# # treatmentreasoning         2054
+# # EE2                        2858
+# # EE3                        2718
+# # domainlegal                2771
+# # domainmath                 2497
+# # domainmedical              2905
+# # domainmisinfo              2635
+# # treatmentreasoning:EE2     2634
+# # treatmentreasoning:EE3     2917
+
+# # Further Distributional Parameters:
+# #       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# # sigma     0.87      0.03     0.81     0.94 1.00     3154     3110
+
+# # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# # and Tail_ESS are effective sample size measures, and Rhat is the potential
+# # scale reduction factor on split chains (at convergence, Rhat = 1).
+
+m_e_cal <- brm(
+  e_formula_cal,
+  data = df_e_label_analysis,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_e_cal)
+```
+
+# J and E by accuracies
+```{r}
+# Regress binarized J and E categories on performance and SDT outcomes.
+# Predictors are participant-level: response accuracy, criterion, discrimination, verification.
+library(broom.mixed)
+
+# 1) Participant-level SDT/performance predictors from trial-level behavior
+df_perf_participant <- df_final %>%
+  filter(!is.na(participant_id), !is.na(ai_correct), !is.na(said_ai_correct), !is.na(correct)) %>%
+  mutate(
+    ai_correct = as.integer(ai_correct),
+    said_ai_correct = as.integer(said_ai_correct),
+    correct = as.integer(correct)
+  ) %>%
+  group_by(participant_id) %>%
+  summarise(
+    treatment = first(treatment),
+    accuracy = mean(correct, na.rm = TRUE),
+    hit_rate = mean(said_ai_correct[ai_correct == 1], na.rm = TRUE),
+    fa_rate = mean(said_ai_correct[ai_correct == 0], na.rm = TRUE),
+    verification = mean(1L - said_ai_correct[ai_correct == 0], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Clamp rates for stable probit transform
+    hit_rate = pmin(pmax(hit_rate, 1e-4), 1 - 1e-4),
+    fa_rate = pmin(pmax(fa_rate, 1e-4), 1 - 1e-4),
+    criterion = -0.5 * (qnorm(hit_rate) + qnorm(fa_rate)),
+    discrimination = qnorm(hit_rate) - qnorm(fa_rate),
+    accuracy_z = as.numeric(scale(accuracy)),
+    criterion_z = as.numeric(scale(criterion)),
+    discrimination_z = as.numeric(scale(discrimination)),
+    verification_z = as.numeric(scale(verification))
+  )
+
+# 2) Attach binary J and E category outcomes at response level
+j_label_cols <- unname(j1_labels)
+e_labels <- c("E1" = "Analytic", "E2" = "Intuitive", "E3" = "Metacognitive")
+
+df_cat_reg <- df_just_analysis %>%
+  filter(!is.na(row_idx), !is.na(participant_id), !is.na(item_id), !is.na(E)) %>%
+  left_join(
+    df_j1_binary %>% select(row_idx, all_of(j_label_cols)),
+    by = "row_idx"
+  ) %>%
+  mutate(
+    Analytic = as.integer(E == "E1"),
+    Intuitive = as.integer(E == "E2"),
+    Metacognitive = as.integer(E == "E3")
+  ) %>%
+  left_join(
+    df_perf_participant %>%
+      select(participant_id, treatment, accuracy_z, criterion_z, discrimination_z, verification_z),
+    by = c("participant_id", "treatment")
+  ) %>%
+  mutate(
+    treatment = factor(treatment),
+    domain = factor(domain)
+  ) %>%
+  filter(
+    !if_any(all_of(c(j_label_cols, unname(e_labels))), is.na),
+    !is.na(accuracy_z),
+    !is.na(criterion_z),
+    !is.na(discrimination_z),
+    !is.na(verification_z)
+  )
+
+# 3) Fit one multivariate model for J and one multivariate model for E
+pred_terms <- c("accuracy_z", "criterion_z", "discrimination_z", "verification_z")
+rhs <- "accuracy_z + criterion_z + discrimination_z + verification_z + treatment + domain + (1 | p | participant_id) + (1 | q | item_id)"
+
+j_bfs <- map(j_label_cols, ~ bf(as.formula(paste0(.x, " ~ ", rhs)), family = bernoulli()))
+e_bfs <- map(unname(e_labels), ~ bf(as.formula(paste0(.x, " ~ ", rhs)), family = bernoulli()))
+
+j_prior <- do.call(
+  c,
+  c(
+    map(j_label_cols, ~ prior(normal(0, 1), class = "b", resp = .x)),
+    map(j_label_cols, ~ prior(normal(0, 2), class = "Intercept", resp = .x))
+  )
+)
+
+e_prior <- do.call(
+  c,
+  c(
+    map(unname(e_labels), ~ prior(normal(0, 1), class = "b", resp = .x)),
+    map(unname(e_labels), ~ prior(normal(0, 2), class = "Intercept", resp = .x))
+  )
+)
+
+m_j_cat_mv <- brm(
+  Reduce(`+`, j_bfs) + set_rescor(FALSE),
+  data = df_cat_reg,
+  prior = j_prior,
+  chains = 4, cores = 4, iter = 2000
+)
+
+m_e_cat_mv <- brm(
+  Reduce(`+`, e_bfs) + set_rescor(FALSE),
+  data = df_cat_reg,
+  prior = e_prior,
+  chains = 4, cores = 4, iter = 2000
+)
+
+# 4) Extract focal predictor effects from multivariate models
+extract_mv_effects <- function(model, responses, model_group) {
+  map_dfr(responses, function(resp) {
+    fx <- as_tibble(fixef(model, resp = resp), rownames = "term")
+    fx %>%
+      filter(term %in% pred_terms) %>%
+      transmute(
+        model = model_group,
+        category = resp,
+        Predictor = term,
+        estimate = Estimate,
+        std.error = Est.Error,
+        l95 = Q2.5,
+        u95 = Q97.5,
+        OR = exp(Estimate),
+        OR_lwr = exp(Q2.5),
+        OR_upr = exp(Q97.5)
+      )
+  })
+}
+
+cat_reg_results <- bind_rows(
+  extract_mv_effects(m_j_cat_mv, j_label_cols, "J multivariate"),
+  extract_mv_effects(m_e_cat_mv, unname(e_labels), "E multivariate")
+)
+
+cat("\n", strrep("=", 90), "\n")
+cat("CATEGORY REGRESSION: Joint multivariate J and E models\n")
+cat(strrep("=", 90), "\n")
+
+print(
+  cat_reg_results %>%
+    mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+    rename(
+      Model = model,
+      Category = category,
+      `Log-OR` = estimate,
+      SE = std.error
+    ),
+  n = Inf
+)
+```
+
+
+
+
+
+# Base Rates analysis
+
+```{r}
+# Base-rate sensitivity plot: expected accuracy as a function of AI correctness rate p
+#
+# p is the proportion of AI answers that are actually correct.
+# Expected accuracy in each condition is:
+#   p * Pr(human correct | AI correct, condition) +
+#   (1 - p) * Pr(human correct | AI incorrect, condition)
+#
+# The dashed y = p line is a rubber-stamp baseline: always accept the AI answer.
+
+# Reconstruct the non-math analysis frame because later chunks reuse df_final for
+# time/justification analyses.
+df_base_rate <- bind_rows(df1_long, df2_long) %>%
+  left_join(ground_truth, by = "item_id") %>%
+  filter(domain != "math", !is.na(ai_correct), !is.na(correct), !is.na(treatment)) %>%
+  mutate(
+    domain = droplevels(factor(domain)),
+    treatment = factor(treatment, levels = c("answer", "reasoning")),
+    ai_correct = as.integer(ai_correct)
+  )
+
+domain_weights <- df_base_rate %>%
+  count(domain, name = "n") %>%
+  mutate(weight = n / sum(n)) %>%
+  select(domain, weight)
+
+nd_base_rate <- expand.grid(
+  treatment = levels(df_base_rate$treatment),
+  ai_correct = c(0L, 1L),
+  domain = levels(df_base_rate$domain)
+) %>%
+  as_tibble() %>%
+  mutate(
+    treatment = factor(treatment, levels = levels(df_base_rate$treatment)),
+    domain = factor(domain, levels = levels(df_base_rate$domain))
+  )
+
+# Predicted participant accuracy for each treatment x AI-correctness x domain cell.
+m_ai_interact <- brm(
+  correct ~ treatment * factor(ai_correct) + domain + (1 | participant_id) + (1 | item_id),
+  data = df_base_rate,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1.5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 2000
+)
+summary(m_ai_interact)
+save(m_ai_interact, file = "models/m_ai_interact.RData")
+
+
+# Multilevel Hyperparameters:
+# ~item_id (Number of levels: 40) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.27      0.19     0.01     0.71 1.00     1358     1763
+
+# ~participant_id (Number of levels: 95) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     0.26      0.19     0.01     0.69 1.00     1495     2076
+
+# Regression Coefficients:
+#                                      Estimate Est.Error l-95% CI u-95% CI Rhat
+# Intercept                                0.17      0.29    -0.41     0.75 1.00
+# treatmentreasoning                      -0.84      0.30    -1.44    -0.26 1.00
+# factorai_correct1                        0.79      0.30     0.19     1.40 1.00
+# domainlegal                             -0.12      0.33    -0.76     0.53 1.00
+# domainmedical                           -0.14      0.33    -0.78     0.52 1.00
+# domainmisinfo                           -0.27      0.34    -0.92     0.41 1.00
+# treatmentreasoning:factorai_correct1     1.99      0.43     1.15     2.81 1.00
+#                                      Bulk_ESS Tail_ESS
+# Intercept                                4237     3174
+# treatmentreasoning                       4026     3387
+# factorai_correct1                        4053     3601
+# domainlegal                              4319     2714
+# domainmedical                            3939     3240
+# domainmisinfo                            4681     3186
+# treatmentreasoning:factorai_correct1     4292     3333
+
+draws_base_rate <- posterior_epred(
+  m_ai_interact,
+  newdata = nd_base_rate,
+  re_formula = NA
+)
+
+cell_draws <- as_tibble(draws_base_rate) %>%
+  mutate(.draw = row_number()) %>%
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "cell",
+    values_to = "accuracy"
+  ) %>%
+  mutate(cell = as.integer(str_remove(cell, "^V"))) %>%
+  left_join(
+    nd_base_rate %>% mutate(cell = row_number()),
+    by = "cell"
+  ) %>%
+  left_join(domain_weights, by = "domain")
+
+# Average over the domains using the observed domain distribution.
+condition_accuracy_draws <- cell_draws %>%
+  group_by(.draw, treatment, ai_correct) %>%
+  summarise(
+    accuracy = weighted.mean(accuracy, weight),
+    .groups = "drop"
+  ) %>%
+  mutate(ai_state = if_else(ai_correct == 1L, "ai_correct", "ai_incorrect")) %>%
+  select(.draw, treatment, ai_state, accuracy) %>%
+  pivot_wider(names_from = ai_state, values_from = accuracy)
+
+p_grid <- tibble(p = seq(0, 1, by = 0.01))
+
+expected_accuracy_draws <- condition_accuracy_draws %>%
+  tidyr::expand_grid(p = p_grid$p) %>%
+  mutate(expected_accuracy = p * ai_correct + (1 - p) * ai_incorrect)
+
+expected_accuracy_summary <- expected_accuracy_draws %>%
+  group_by(treatment, p) %>%
+  summarise(
+    estimate = mean(expected_accuracy),
+    lower = quantile(expected_accuracy, 0.025),
+    upper = quantile(expected_accuracy, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(treatment_label = if_else(treatment == "answer", "Answer", "Reasoning"))
+
+# Draw-level crossover between the two condition lines.
+crossover_draws <- condition_accuracy_draws %>%
+  select(.draw, treatment, ai_incorrect, ai_correct) %>%
+  pivot_wider(
+    names_from = treatment,
+    values_from = c(ai_incorrect, ai_correct)
+  ) %>%
+  mutate(
+    diff_p0 = ai_incorrect_reasoning - ai_incorrect_answer,
+    diff_p1 = ai_correct_reasoning - ai_correct_answer,
+    p_cross = -diff_p0 / (diff_p1 - diff_p0),
+    p_cross = if_else(is.finite(p_cross) & p_cross >= 0 & p_cross <= 1, p_cross, NA_real_)
+  )
+
+crossover_summary <- crossover_draws %>%
+  summarise(
+    p_cross = median(p_cross, na.rm = TRUE),
+    lower = quantile(p_cross, 0.025, na.rm = TRUE),
+    upper = quantile(p_cross, 0.975, na.rm = TRUE)
+  )
+
+crossover_p <- crossover_summary$p_cross
+
+rubber_stamp_df <- tibble(p = p_grid$p, expected_accuracy = p_grid$p)
+
+p_base_rate <- ggplot(expected_accuracy_summary,
+                      aes(x = p, y = estimate, color = treatment_label, fill = treatment_label)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_line(
+    data = rubber_stamp_df,
+    aes(x = p, y = expected_accuracy),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.8,
+    color = "gray35"
+  ) +
+  geom_vline(
+    xintercept = crossover_p,
+    linetype = "dotted",
+    linewidth = 0.8,
+    color = "gray25",
+    na.rm = TRUE
+  ) +
+  annotate(
+    "text",
+    x = crossover_p,
+    y = 0.08,
+    label = paste0("Crossover p = ", round(crossover_p, 2)),
+    size = 11 / .pt,
+    family = "Arial",
+    color = "black",
+    na.rm = TRUE
+  ) +
+  annotate(
+    "text",
+    x = 0.78,
+    y = 0.82,
+    label = "y = p",
+    color = "black",
+    size = 11 / .pt,
+    family = "Arial"
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, by = 0.2),
+    limits = c(0, 1)
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, by = 0.2),
+    limits = c(0, 1)
+  ) + #"#ff7f0e", "Reasoning" = "#1f77b4"
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  scale_fill_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = "Base rate of correct AI answers (p)",
+    y = "Expected participant accuracy",
+    color = "Condition",
+    fill = "Condition"
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    text = element_text(size = 11, color = "black", family = "Arial"),
+    axis.title = element_text(size = 11, color = "black"),
+    axis.text = element_text(size = 11, color = "black"),
+    legend.title = element_text(size = 11, color = "black"),
+    legend.text = element_text(size = 11, color = "black"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4)
+  )
+windows()
+print(p_base_rate)
+ggsave("plot/fig_expected_accuracy_by_ai_base_rate.pdf",
+       p_base_rate, width = 5, height = 3, dpi = 300)
+
+crossover_summary
+```
+  <!-- p_cross lower upper
+    <dbl> <dbl> <dbl>
+1   0.523 0.523 0.523 -->
+
+```{r}
+# Complementary base-rate analysis: human+AI team accuracy vs. AI alone
+# AI-alone accuracy is p, corresponding to a rubber-stamp strategy of always
+# accepting the AI answer. The human+AI team estimate is the participant's
+# model-implied accuracy after seeing the AI response, reweighted across
+# plausible AI correctness base rates.
+
+plausible_p_grid <- tibble(p = seq(0.50, 0.95, by = 0.01))
+observed_ai_base_rate <- mean(df_base_rate$ai_correct, na.rm = TRUE)
+
+team_accuracy_draws <- condition_accuracy_draws %>%
+  tidyr::expand_grid(p = plausible_p_grid$p) %>%
+  mutate(
+    team_accuracy = p * ai_correct + (1 - p) * ai_incorrect,
+    incremental_accuracy = team_accuracy - p
+  )
+
+team_accuracy_summary <- team_accuracy_draws %>%
+  group_by(treatment, p) %>%
+  summarise(
+    estimate = mean(team_accuracy),
+    lower = quantile(team_accuracy, 0.025),
+    upper = quantile(team_accuracy, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(treatment_label = if_else(treatment == "answer", "Answer", "Reasoning"))
+
+incremental_summary <- team_accuracy_draws %>%
+  group_by(treatment, p) %>%
+  summarise(
+    estimate = mean(incremental_accuracy),
+    lower = quantile(incremental_accuracy, 0.025),
+    upper = quantile(incremental_accuracy, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(treatment_label = if_else(treatment == "answer", "Answer", "Reasoning"))
+
+ai_alone_df <- plausible_p_grid %>%
+  mutate(ai_alone_accuracy = p)
+
+team_vs_ai_table <- team_accuracy_summary %>%
+  filter(p %in% c(0.50, 0.60, 0.70, 0.80, 0.90, 0.95)) %>%
+  left_join(incremental_summary %>% select(treatment, p, increment = estimate),
+            by = c("treatment", "p")) %>%
+  mutate(
+    ai_alone = p,
+    across(c(estimate, lower, upper, increment, ai_alone), ~ round(.x, 3))
+  ) %>%
+  select(
+    p,
+    condition = treatment_label,
+    ai_alone,
+    team_accuracy = estimate,
+    lower,
+    upper,
+    increment
+  )
+
+p_team_vs_ai <- ggplot(team_accuracy_summary,
+                       aes(x = p, y = estimate, color = treatment_label, fill = treatment_label)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_line(
+    data = ai_alone_df,
+    aes(x = p, y = ai_alone_accuracy),
+    inherit.aes = FALSE, linetype = "dashed", linewidth = 0.9, color = "gray25"
+  ) +
+  geom_vline(
+    xintercept = observed_ai_base_rate, linetype = "dotted",
+    linewidth = 0.7, color = "gray35"
+  ) +
+  annotate(
+    "text", x = 0.88, y = 0.91, label = "AI alone: y = p",
+    color = "gray25", size = 4.2
+  ) +
+  annotate(
+    "label", x = observed_ai_base_rate, y = 0.54,
+    label = paste0("Observed p = ", round(observed_ai_base_rate, 2)),
+    size = 3.8, label.size = 0.2, fill = "white"
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0.50, 0.95, by = 0.10), limits = c(0.50, 0.95)
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0.50, 1.00, by = 0.10), limits = c(0.50, 1.00)
+  ) +
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  scale_fill_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = "Base rate of correct AI answers (p)",
+    y = "Expected accuracy",
+    color = "Human+AI condition",
+    fill = "Human+AI condition"
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    text = element_text(size = 11, color = "black", family = "Arial"),
+    axis.title = element_blank(),
+    axis.text = element_text(size = 11, color = "black"),
+    legend.title = element_text(size = 11, color = "black"),
+    legend.text = element_text(size = 11, color = "black"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4)
+  )
+
+p_increment_vs_ai <- ggplot(incremental_summary,
+                            aes(x = p, y = estimate, color = treatment_label, fill = treatment_label)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.8, color = "gray35") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_vline(
+    xintercept = observed_ai_base_rate,
+    linetype = "dotted",
+    linewidth = 0.7,
+    color = "gray35",
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0.50, 0.95, by = 0.10),
+    limits = c(0.50, 0.95)
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_color_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  scale_fill_manual(values = c("Answer" = "#ff7f0e", "Reasoning" = "#1f77b4")) +
+  labs(
+    x = "Base rate of correct AI answers (p)",
+    y = "Human+AI accuracy minus \n AI-alone accuracy",
+    color = "Condition",
+    fill = "Condition"
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    text = element_text(size = 11, color = "black", family = "Arial"),
+    axis.title = element_text(size = 11, color = "black"),
+    axis.text = element_text(size = 11, color = "black"),
+    legend.title = element_text(size = 11, color = "black"),
+    legend.text = element_text(size = 11, color = "black"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4)
+  )
+
+print(p_team_vs_ai)
+print(p_increment_vs_ai)
+print(team_vs_ai_table)
+
+ggsave("plot/fig_team_accuracy_vs_ai_alone.pdf",
+       p_team_vs_ai, width = 5, height = 3, dpi = 300)
+ggsave("plot/fig_incremental_human_contribution_vs_ai_alone.pdf",
+       p_increment_vs_ai, width = 5, height = 3, dpi = 300)
+
+# 2 panel labelled a and b for p_team_vs_ai and p_base_rate
+shared_legend <- cowplot::get_legend(
+  p_increment_vs_ai + theme(legend.position = "bottom")
+)
+
+panel_row <- cowplot::plot_grid(
+  p_base_rate +
+    labs(title = "a Expected accuracy by AI base rate") +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 11)),
+  p_increment_vs_ai +
+    labs(title = "b Human+AI accuracy minus AI-alone accuracy") +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 11)),
+  ncol = 2, align = "v", labels = NULL
+)
+
+panel <- cowplot::plot_grid(
+  panel_row,
+  cowplot::plot_grid(NULL, shared_legend, NULL, ncol = 3, rel_widths = c(1, 1, 1)),
+  ncol = 1,
+  rel_heights = c(1, 0.12)
+)
+windows()
+panel
+ggsave("plot/fig_base_rate_analysis.pdf",
+       panel, width = 7.0 , height = 3.0, dpi = 300)
+
+
+```
+
+   <!-- p condition ai_alone team_accuracy lower upper increment
+   <dbl> <chr>        <dbl>         <dbl> <dbl> <dbl>     <dbl>
+ 1  0.5  Answer        0.5          0.609 0.538 0.675     0.109
+ 2  0.6  Answer        0.6          0.63  0.558 0.696     0.03 
+ 3  0.7  Answer        0.7          0.65  0.577 0.717    -0.05 
+ 4  0.8  Answer        0.8          0.67  0.593 0.741    -0.13 
+ 5  0.9  Answer        0.9          0.691 0.608 0.767    -0.209
+ 6  0.95 Answer        0.95         0.701 0.614 0.78     -0.249
+ 7  0.5  Reasoning     0.5          0.579 0.52  0.638     0.079
+ 8  0.6  Reasoning     0.6          0.633 0.575 0.689     0.033
+ 9  0.7  Reasoning     0.7          0.688 0.628 0.74     -0.012
+10  0.8  Reasoning     0.8          0.742 0.68  0.794    -0.058
+11  0.9  Reasoning     0.9          0.796 0.73  0.851    -0.104
+12  0.95 Reasoning     0.95         0.823 0.754 0.88     -0.127 -->
