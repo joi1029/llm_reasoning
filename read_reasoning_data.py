@@ -135,14 +135,14 @@ def clean_llm_reasoning_survey(df: pd.DataFrame) -> pd.DataFrame:
     
     all_columns = {**basic_columns, **reasoning_columns, **post_columns}
     
-    # rename columns that exist in the dataframe
+    # rename columns
     existing_columns = {k: v for k, v in all_columns.items() if k in df.columns}
     df = df.rename(columns=existing_columns)
     print(f"Renamed {len(existing_columns)} columns")
     
     columns_to_keep = list(existing_columns.values())
-    
-    # keep any additional columns that might be useful
+
+
     additional_cols = []
     for col in df.columns:
         if any(pattern in col.lower() for pattern in ['worktime', 'tasktime', 'offtask', 'ontask']):
@@ -154,7 +154,6 @@ def clean_llm_reasoning_survey(df: pd.DataFrame) -> pd.DataFrame:
     final_columns = [col for col in columns_to_keep if col in df.columns]
     df = df[final_columns].copy()
     
-    # Convert correctness judgments to boolean 
     correctness_cols = [col for col in df.columns if 'correctness' in col]
     for col in correctness_cols:
         # First try numeric conversion (1=correct, 2=incorrect)
@@ -163,7 +162,7 @@ def clean_llm_reasoning_survey(df: pd.DataFrame) -> pd.DataFrame:
         if not numeric_vals.isna().all():
             df[col] = numeric_vals.map({1: True, 2: False})
 
-# Reverse coding: confidence, knowledge, trust in AI
+    # Reverse coding: confidence, knowledge, trust in AI
     # Convert confidence and knowledge ratings to numeric
     rating_cols = [col for col in df.columns if any(x in col for x in ['confidence', 'knowledge'])]
     for col in rating_cols:
@@ -191,24 +190,21 @@ def clean_llm_reasoning_survey(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors='coerce')
         df[col] = 6 - df[col]  # Reverse
     
-    # Convert timing columns to numeric
+    # columns to numeric
     timing_cols = [col for col in df.columns if 'time' in col]
     for col in timing_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # Convert duration to numeric
+
     if 'duration_seconds' in df.columns:
         df['duration_seconds'] = pd.to_numeric(df['duration_seconds'], errors='coerce')
-    
-    # Create a fresh copy to avoid fragmentation warnings
+
     df = df.copy()
     
-    # Create summary statistics
+
     df['total_questions_answered'] = df[correctness_cols].notna().sum(axis=1)
     df['correct_answers'] = df[correctness_cols].sum(axis=1)
     df['accuracy'] = df['correct_answers'] / df['total_questions_answered']
     
-    # Calculate average confidence and knowledge across domains
     confidence_cols = [col for col in df.columns if 'confidence' in col]
     knowledge_cols = [col for col in df.columns if 'knowledge' in col]
     
@@ -235,17 +231,12 @@ def add_ground_truth_comparison(df: pd.DataFrame) -> pd.DataFrame:
     - total_questions_correct: count of questions answered correctly
     - total_questions_attempted: count of questions with responses
     """
-    # Load ground truth data
-    try:
-        ground_truth = pd.read_csv(r'c:/Users/joice/MSRA/reasoning/data/reasoning_results_processed0728.csv', 
+
+    ground_truth = pd.read_csv(r'llm_reasoning/data/reasoning_results_processed0728.csv', 
                                  encoding='latin1')
-    except:
-        print("Warning: Could not load ground truth file. Skipping ground truth comparison.")
-        return df
+
     
-    print(f"Loaded ground truth with {len(ground_truth)} questions")
-    
-    # Convert ground truth correctness to boolean (in case it's stored as string "TRUE"/"FALSE")
+    # Convert ground truth correctness to boolean
     if 'correctness' in ground_truth.columns:
         ground_truth['correctness'] = ground_truth['correctness'].map({
             'TRUE': True, 
@@ -259,7 +250,6 @@ def add_ground_truth_comparison(df: pd.DataFrame) -> pd.DataFrame:
     # Create ground truth lookup using question_id instead of id
     gt_lookup = dict(zip(ground_truth['question_id'], ground_truth['correctness']))
     
-    # Add correctness evaluation columns
     participant_correct_count = 0
     total_comparisons = 0
     
@@ -329,7 +319,6 @@ def add_ground_truth_comparison(df: pd.DataFrame) -> pd.DataFrame:
             elif original_question_id:
                 print(f"Warning: No ground truth found for question {original_question_id} ({col})")
     
-    # Find all columns that indicate if participant got questions correct
     got_correct_cols = [col for col in df.columns if 'got_correct' in col]
     if got_correct_cols:
         # Calculate accuracy: proportion of questions participant got correct
@@ -341,11 +330,8 @@ def add_ground_truth_comparison(df: pd.DataFrame) -> pd.DataFrame:
         print(f"Overall participant accuracy vs ground truth: {participant_correct_count}/{total_comparisons} = {participant_correct_count/total_comparisons:.1%}" if total_comparisons > 0 else "No comparisons available")
     else:
         print("Warning: No ground truth comparison columns were created")
-    
-    # Evaluate CRT questions
-    print("\nEvaluating CRT (Cognitive Reflection Test) questions...")
-    
-    # Define correct answers with alternatives
+
+
     crt_correct_answers = {
         'crt_bat_ball': ['0.05', '.05', '0.05', '5', 'five cents', '5 cents', 'five', '$0.05'],
         'crt_machines': ['5', 'five', '5 minutes', 'five minutes'],
@@ -459,8 +445,7 @@ def filter_to_demographic_participants(
 
 def analyze_survey_completion(df: pd.DataFrame) -> Dict:
     stats = {}
-    
-    # Analyze completion by domain
+
     domains = ['legal', 'math', 'finance', 'medical', 'misinfo']
     
     for domain in domains:
@@ -485,7 +470,7 @@ def analyze_survey_completion(df: pd.DataFrame) -> Dict:
     return stats
 
 if __name__ == "__main__":
-    # Read the CSV file
+    # Read the CSV files
     input_file1 = r"c:\Users\joice\MSRA\reasoning\data\LLM-Reasoning_Reasoning_August 4, 2026_19.18.csv"
     input_file2 = r"C:\Users\joice\MSRA\reasoning\data\LLM-Reasoning_Answer_August 4, 2026_19.24.csv"
     demographic_file1 = r"c:\Users\joice\MSRA\reasoning\data\reasoning_prolific_demographic_export_68f46dab021946cc658677df.csv"
@@ -495,12 +480,11 @@ if __name__ == "__main__":
     df1 = pd.read_csv(input_file1)
     df2 = pd.read_csv(input_file2)
 
-    # Clean the data
     print("\nCleaning data...")
     cleaned_df1 = clean_llm_reasoning_survey(df1)
     cleaned_df2 = clean_llm_reasoning_survey(df2)
 
-    # Keep only participants present in the matching approved demographic export.
+    # filter to participants present in the demographic export
     cleaned_df1 = filter_to_demographic_participants(
         cleaned_df1,
         demographic_file1,
@@ -512,19 +496,12 @@ if __name__ == "__main__":
         "answer"
     )
 
-    # Add ground truth comparison
+
     print("\nAdding ground truth comparison...")
     cleaned_df1 = add_ground_truth_comparison(cleaned_df1)
     cleaned_df2 = add_ground_truth_comparison(cleaned_df2)
 
-    # Remove a specific respondent (by prolific_id) from the cleaned answers dataframe
-    # remove_pid = "672bc3ce315f709fe35a3392"
-    # if "prolific_id" in cleaned_df2.columns:
-    #     cleaned_df2 = cleaned_df2[
-    #         cleaned_df2["prolific_id"].astype("string").str.strip() != remove_pid
-    #     ].copy()
 
-    # Analyze completion patterns
     print("\nAnalyzing completion patterns...")
     stats1 = analyze_survey_completion(cleaned_df1)
     stats2 = analyze_survey_completion(cleaned_df2)
@@ -537,8 +514,8 @@ if __name__ == "__main__":
             print(f"{key}: {value}")
     
     # Save the cleaned data
-    output_file1 = r"c:\Users\joice\MSRA\reasoning\cleaned_llm_reasoning.csv"
-    output_file2 = r"c:\Users\joice\MSRA\reasoning\cleaned_llm_answers.csv"
+    output_file1 = r"c:\Users\joice\MSRA\llm_reasoning\cleaned_llm_reasoning.csv"
+    output_file2 = r"c:\Users\joice\MSRA\llm_reasoning\cleaned_llm_answers.csv"
     cleaned_df1.to_csv(output_file1, index=False)
     cleaned_df2.to_csv(output_file2, index=False)
     print(f"\nCleaned data saved to: {output_file1}")

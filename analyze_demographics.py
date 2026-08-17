@@ -26,9 +26,7 @@ print("=" * 60)
 # columns of interest
 focus_cols = ['Primary language', 'Age', 'Sex', 'Ethnicity simplified']
 
-# -----------------------------------------------------------------------------
-# Sample sizes
-# -----------------------------------------------------------------------------
+# sample sizes
 print("\n--- SAMPLE SIZES ---")
 print(demo_all['condition'].value_counts())
 print(f"\nTotal participants: {len(demo_all)}")
@@ -57,9 +55,7 @@ print(f"\nMann-Whitney U test:")
 print(f"  U-statistic: {u_stat:.1f}")
 print(f"  p-value: {u_pvalue:.4f}")
 
-# -----------------------------------------------------------------------------
-# SEX ANALYSIS
-# -----------------------------------------------------------------------------
+# sex
 print("\n" + "=" * 60)
 print("SEX ANALYSIS")
 print("=" * 60)
@@ -81,9 +77,7 @@ print(f"  Chi-square statistic: {chi2:.3f}")
 print(f"  Degrees of freedom: {dof}")
 print(f"  p-value: {p_chi:.4f}")
 
-# -----------------------------------------------------------------------------
-# PRIMARY LANGUAGE ANALYSIS
-# -----------------------------------------------------------------------------
+# primary language
 print("\n" + "=" * 60)
 print("PRIMARY LANGUAGE ANALYSIS")
 print("=" * 60)
@@ -115,9 +109,7 @@ print("\nDetailed primary language distribution:")
 lang_detail = demo_all.groupby('condition')['Primary language'].value_counts()
 print(lang_detail)
 
-# -----------------------------------------------------------------------------
-# ETHNICITY ANALYSIS
-# -----------------------------------------------------------------------------
+# ethnicity
 print("\n" + "=" * 60)
 print("ETHNICITY ANALYSIS")
 print("=" * 60)
@@ -150,9 +142,7 @@ if eth_crosstab_valid.size > 0:
     if min_expected < 5:
         print("  Note: Some expected counts < 5, chi-square may not be reliable.")
 
-# -----------------------------------------------------------------------------
-# SUMMARY TABLE
-# -----------------------------------------------------------------------------
+# summary
 print("\n" + "=" * 60)
 print("SUMMARY: DEMOGRAPHIC COMPARISON")
 print("=" * 60)
@@ -206,21 +196,3 @@ summary_data.append({
 summary_df = pd.DataFrame(summary_data)
 print("\n")
 print(summary_df.to_string(index=False))
-
-# -----------------------------------------------------------------------------
-# DATA QUALITY CHECK
-# -----------------------------------------------------------------------------
-print("\n" + "=" * 60)
-print("DATA QUALITY: MISSING/EXPIRED VALUES")
-print("=" * 60)
-
-for col in focus_cols:
-    missing = demo_all[col].isna().sum()
-    expired = (demo_all[col] == 'DATA_EXPIRED').sum()
-    print(f"{col}:")
-    print(f"  Missing: {missing}")
-    print(f"  DATA_EXPIRED: {expired}")
-
-print("\n" + "=" * 60)
-print("Analysis complete.")
-print("=" * 60)
