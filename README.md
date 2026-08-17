@@ -71,11 +71,9 @@ This R Markdown document contains the Bayesian signal detection theory analysis 
 
 ## Folders
 
-The `data/` directory contains both raw and processed outputs. Key files include:
+The `data/` directory contains cleaned survey outputs. Key files include:
 
-- raw Qualtrics exports for the survey responses
-- Prolific demographic exports
-- filtered demographic CSVs for final participant samples
+- cleaned demographic CSV files used for analysis
 - processed reasoning/answer datasets used in the paper
 - justification response files used for labeling and qualitative analysis
 
